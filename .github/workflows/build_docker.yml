@@ -12,12 +12,18 @@ jobs:
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
+        
+      - name: Setting env
+        run: echo "::set-env name=GIT_SHA::$(git rev-parse --short "$GITHUB_SHA")"
 
       - name: Build HORNET Docker image
-        run: docker build . -f docker/Dockerfile.dev -t iotaledger/hornet:$(git rev-parse --short "$GITHUB_SHA") -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$(git rev-parse --short "$GITHUB_SHA") -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:latest
+        run: docker build . -f docker/Dockerfile.dev -t iotaledger/hornet:$GIT_SHA -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$GIT_SHA -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:latest
+
+      - name: Build HORNET Docker image - ARM64
+        run: docker build . -f docker/Dockerfile.arm64 -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$GIT_SHA-arm64 -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:latest-arm64
 
       - name: Test HORNET Docker image
-        run: docker run --rm --name hornet iotaledger/hornet:$(git rev-parse --short "$GITHUB_SHA") --version 2>/dev/null | grep -q "HORNET"
+        run: docker run --rm --name hornet iotaledger/hornet:$GIT_SHA --version 2>/dev/null | grep -q "HORNET"
 
       - name: AWS login
         run: |
@@ -32,15 +38,17 @@ jobs:
 
       - name: Docker push
         run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$(git rev-parse --short "$GITHUB_SHA")
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$GIT_SHA
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:latest
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$GIT_SHA-arm64
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:latest-arm64
 
       - name: Docker push - Release
         run: |
           export RELEASE_VERSION=${GITHUB_REF#refs/*/}
-          docker tag iotaledger/hornet:$(git rev-parse --short "$GITHUB_SHA") ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$RELEASE_VERSION
-          docker tag iotaledger/hornet:$(git rev-parse --short "$GITHUB_SHA") iotaledger/hornet:$RELEASE_VERSION
-          docker tag iotaledger/hornet:$(git rev-parse --short "$GITHUB_SHA") iotaledger/hornet:latest
+          docker tag iotaledger/hornet:$GIT_SHA ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$RELEASE_VERSION
+          docker tag iotaledger/hornet:$GIT_SHA iotaledger/hornet:$RELEASE_VERSION
+          docker tag iotaledger/hornet:$GIT_SHA iotaledger/hornet:latest
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/hornet:$RELEASE_VERSION
           docker push iotaledger/hornet:$RELEASE_VERSION
           docker push iotaledger/hornet:latest
