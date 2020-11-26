@@ -1,5 +1,5 @@
 ARG TARGETARCH
-# golang 1.14.6-buster
+
 FROM golang:1.15.5-buster AS build
 
 # Ensure ca-certficates are up to date
