@@ -1,5 +1,6 @@
-# golang 1.15.5-buster
-FROM golang@sha256:eb88b20326f70fbf943af9d62650d8293d62fb5764c50e7477cdcb33caf9ff73 AS build
+ARG TARGETARCH
+
+FROM golang:1.15.5-buster AS build
 
 # Ensure ca-certficates are up to date
 RUN update-ca-certificates
@@ -19,7 +20,7 @@ RUN go mod verify
 COPY . .
 
 # Build the binary
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags="pow_avx" \
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -tags="pow_avx" \
       -ldflags='-w -s -extldflags "-static"' -a \
        -o /go/bin/hornet
 
