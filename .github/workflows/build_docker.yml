@@ -63,10 +63,16 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
 
+    # strategy:
+    #   matrix:
+    #     environment: ["comnet", "devnet", "mainnet"]
+
     steps:
-      - name: Triggering Hornet deployment
+      - name: Triggering Hornet deployment - Comnet 
+      # For now deployment "environment" is hardcoded to comnet. Each env should/shall have its own github deployment
         run: |
           curl -X POST https://api.github.com/repos/iotaledger/hornet/deployments \
           -H 'Accept: application/vnd.github.v3+json' \
           -u ${{ secrets.GIT_TOKEN }} \
           --data '{"ref": "${{ needs.build.outputs.git_sha }}", "task": "deploy", "automerge": false, "required_contexts": [], "payload": {}, "environment": "comnet", "description": "", "transient_environment": false, "production_environment": false}'
+
