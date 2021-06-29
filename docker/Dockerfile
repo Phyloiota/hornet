@@ -39,15 +39,16 @@ RUN GOOS=linux GOARCH=amd64 go build \
 ############################
 FROM alpine:latest
 
-RUN apk --no-cache add glibc openssl openssl-dev libressl-dev 
-
 EXPOSE 8081/tcp
 EXPOSE 14265/tcp
 EXPOSE 15600/tcp
 EXPOSE 1883/tcp
 
 # Copy the binary into base image
-COPY --chown=nonroot:nonroot --from=build /go/bin/hornet /app/hornet
+RUN addgroup --gid 39999 hornet \
+ && adduser -h /app -s /bin/sh -G hornet -u 39999 -D hornet 
+
+COPY --chown=hornet:hornet --from=build /go/bin/hornet /app/hornet
 
 # Copy the assets
 COPY ./config.json /app/config.json
@@ -56,6 +57,6 @@ COPY ./peering.json /app/peering.json
 COPY ./profiles.json /app/profiles.json
 
 WORKDIR /app
-USER nonroot
+USER hornet
 
 ENTRYPOINT ["/app/hornet"]
