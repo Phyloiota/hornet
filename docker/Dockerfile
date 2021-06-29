@@ -48,6 +48,8 @@ EXPOSE 1883/tcp
 RUN addgroup --gid 39999 hornet \
  && adduser -h /app -s /bin/sh -G hornet -u 39999 -D hornet 
 
+RUN apk add --no-cache gcompat libc6-compat libstdc++ libgcc openssl openssl-dev
+
 COPY --chown=hornet:hornet --from=build /go/bin/hornet /app/hornet
 
 # Copy the assets
