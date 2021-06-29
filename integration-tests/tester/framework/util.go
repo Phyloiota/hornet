@@ -8,9 +8,9 @@ import (
 	"os"
 )
 
-// getWebAPIBaseURL returns the web API base url for the given IP.
-func getWebAPIBaseURL(hostname string) string {
-	return fmt.Sprintf("http://%s:%d", hostname, WebAPIPort)
+// getNodeAPIBaseURL returns the web API base url for the given IP.
+func getNodeAPIBaseURL(hostname string) string {
+	return fmt.Sprintf("http://%s:%d", hostname, RestAPIPort)
 }
 
 // returns the given error if the provided context is done.

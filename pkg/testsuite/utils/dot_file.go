@@ -1,55 +1,61 @@
 package utils
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os/exec"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/gohornet/hornet/pkg/model/hornet"
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/storage"
 )
 
-// ShortenedHash returns a shortened trinary hash for the given hash.
+// ShortenedHash returns a shortened hex encoded hash for the given hash.
 // this is used for the dot file.
-func ShortenedHash(hash hornet.Hash) string {
-	trytes := hash.Trytes()
-	return trytes[0:4] + "..." + trytes[77:81]
+func ShortenedHash(hash hornet.MessageID) string {
+	hexHash := hash.ToHex()
+	return hexHash[0:4] + "..." + hexHash[len(hexHash)-4:]
 }
 
-// ShortenedTag returns a shortened tag or milestone index for the given bundle.
+// ShortenedIndex returns a shortened index or milestone index for the given message.
 // this is used for the dot file.
-func ShortenedTag(bundle *tangle.CachedBundle) string {
-	if bundle.GetBundle().IsMilestone() {
-		return fmt.Sprintf("%d", bundle.GetBundle().GetMilestoneIndex())
+func ShortenedIndex(cachedMessage *storage.CachedMessage) string {
+	defer cachedMessage.Release(true)
+
+	ms := cachedMessage.GetMessage().GetMilestone()
+	if ms != nil {
+		return fmt.Sprintf("%d", ms.Index)
 	}
 
-	tail := bundle.GetBundle().GetTail()
-	defer tail.Release(true)
+	indexation := storage.CheckIfIndexation(cachedMessage.GetMessage())
 
-	tag := tail.GetTransaction().Tx.Tag
-
-	// Cut the tags at the first 9 or at max length 4
-	tagLength := strings.IndexByte(tag, '9')
-	if tagLength == -1 || tagLength > 4 || tagLength == 0 {
-		tagLength = 4
+	index := indexation.Index
+	if len(index) > 4 {
+		index = index[:4]
 	}
-	return tag[0:tagLength]
+	indexHex := hex.EncodeToString(index)
+
+	if cachedMessage.GetMetadata().IsConflictingTx() {
+		conflict := cachedMessage.GetMetadata().GetConflict()
+		return fmt.Sprintf("%s (%d)", indexHex, conflict)
+	}
+
+	return indexHex
 }
 
 // ShowDotFile creates a png file with dot and shows it in an external application.
-func ShowDotFile(t *testing.T, dotCommand string, outFilePath string) {
+func ShowDotFile(testInterface testing.TB, dotCommand string, outFilePath string) {
 
 	cmd := exec.Command("dot", "-Tpng", "-o"+outFilePath)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		t.Fatal(err)
+		testInterface.Fatal(err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+		testInterface.Fatal(err)
 	}
 
 	stdin.Write([]byte(dotCommand))
@@ -60,14 +66,14 @@ func ShowDotFile(t *testing.T, dotCommand string, outFilePath string) {
 	switch os := runtime.GOOS; os {
 	case "darwin":
 		if err := exec.Command("open", outFilePath).Start(); err != nil {
-			t.Fatal(err)
+			testInterface.Fatal(err)
 		}
 	case "linux":
 		if err := exec.Command("xdg-open", outFilePath).Start(); err != nil {
-			t.Fatal(err)
+			testInterface.Fatal(err)
 		}
 	default:
 		// freebsd, openbsd, plan9, windows...
-		t.Fatalf("OS %s not supported", os)
+		testInterface.Fatalf("OS %s not supported", os)
 	}
 }

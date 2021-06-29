@@ -3,9 +3,12 @@ services:
   hornet:
     build:
       context: .
-      # For aarch64/arm64 use Dockerfile.arm64
       dockerfile: docker/Dockerfile
-    image: hornet:latest
+    image: hornet:dev
+    ulimits:
+      nofile:
+        soft: "8192"
+        hard: "8192"
     # Best performance via host network:
     network_mode: host
     # Else:
@@ -14,15 +17,9 @@ services:
     #  - "15600:15600"
     cap_drop:
       - ALL
-    
     volumes:
       - ./config.json:/app/config.json:ro
-      - ./config_comnet.json:/app/config_comnet.json:ro
-      - ./config_devnet.json:/app/config_devnet.json:ro
-      - ./mqtt_config.json:/app/mqtt_config.json
       - ./profiles.json:/app/profiles.json
       - ./peering.json:/app/peering.json
       - ./snapshots/mainnet:/app/snapshots/mainnet
-      - ./snapshots/comnet:/app/snapshots/comnet
       - ./mainnetdb:/app/mainnetdb
-      - ./comnetdb:/app/comnetdb

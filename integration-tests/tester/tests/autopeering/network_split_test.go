@@ -5,9 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gohornet/hornet/integration-tests/tester/framework"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/gohornet/hornet/integration-tests/tester/framework"
 )
 
 // TestNetworkSplit boots up an autopeered network with two partitions, then verifies that all nodes
@@ -18,16 +19,16 @@ func TestNetworkSplit(t *testing.T) {
 	require.NoError(t, err)
 	defer framework.ShutdownNetwork(t, n)
 
-	// test that nodes only have neighbors from same partition
+	// test that nodes only have peers from same partition
 	for _, partition := range n.Partitions() {
 		for _, peer := range partition.Peers() {
-			peers, err := peer.DebugWebAPI.Neighbors()
+			peers, err := peer.DebugNodeAPIClient.Peers(context.Background())
 			require.NoError(t, err)
-			require.Len(t, peers, 2, "should only be connected to %d neighbors", 2)
+			require.Len(t, peers, 2, "should only be connected to %d peers", 2)
 
-			// check that all neighbors are indeed in the same partition
+			// check that all peers are indeed in the same partition
 			for _, p := range peers {
-				assert.Contains(t, partition.PeersMap(), p.AutopeeringID)
+				assert.Contains(t, partition.PeersMap(), p.ID)
 			}
 		}
 	}

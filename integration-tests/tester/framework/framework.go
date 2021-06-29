@@ -1,18 +1,17 @@
-// Package framework provides integration test functionality for Hornet with a Docker network.
+// Package framework provides integration test functionality for HORNET with a Docker network.
 // It effectively abstracts away all complexity with creating a custom Docker network per test,
 // discovering peers, waiting for them to autopeer and offers easy access to the peers' web API and logs.
 package framework
 
 import (
 	"context"
-	"errors"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/client"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -68,9 +67,17 @@ func newFramework() (*Framework, error) {
 // CfgOverrideFunc is a function which overrides configuration values.
 type CfgOverrideFunc func(index int, cfg *NodeConfig)
 
+// IntegrationNetworkConfig holds configuration for a network.
+type IntegrationNetworkConfig struct {
+	// Whether the network should have a white-flag mock server running.
+	SpawnWhiteFlagMockServer bool
+	// The config to use for the white-flag mock server.
+	WhiteFlagMockServerConfig *WhiteFlagMockServerConfig
+}
+
 // CreateStaticNetwork creates a network made out of statically peered nodes by the given layout.
 // The first node is initialized with the Coordinator plugin enabled.
-func (f *Framework) CreateStaticNetwork(name string, layout StaticPeeringLayout, cfgOverrideF ...CfgOverrideFunc) (*StaticNetwork, error) {
+func (f *Framework) CreateStaticNetwork(name string, intNetCfg *IntegrationNetworkConfig, layout StaticPeeringLayout, cfgOverrideF ...CfgOverrideFunc) (*StaticNetwork, error) {
 	network, err := newNetwork(f.dockerClient, strings.ToLower(name), NetworkTypeStatic, f.tester)
 	if err != nil {
 		return nil, err
@@ -80,16 +87,25 @@ func (f *Framework) CreateStaticNetwork(name string, layout StaticPeeringLayout,
 		return nil, err
 	}
 
+	if intNetCfg != nil {
+		if err := network.CreateWhiteFlagMockServer(intNetCfg.WhiteFlagMockServerConfig); err != nil {
+			return nil, err
+		}
+		// give the mock server some grace time to boot up
+		time.Sleep(10 * time.Second)
+	}
+
 	for i := 0; i < len(layout); i++ {
 		cfg := DefaultConfig()
 		if i == 0 {
 			cfg.AsCoo()
 		}
-		// since we use addNeighbors to peer the nodes with each other, we need to let
-		// them accept any connection. we don't define the neighbors on startup to prevent
+		// since we use addPeers to peer the nodes with each other, we need to let
+		// them accept any connection. we don't define the peers on startup to prevent
 		// nodes from canceling out each other's connection.
-		cfg.Network.AcceptAnyConnection = true
-		cfg.Network.MaxPeers = len(layout)
+		cfg.Network.GossipUnknownPeersLimit = len(layout)
+		cfg.Network.ConnMngLowWatermark = len(layout)
+		cfg.Network.ConnMngHighWatermark = len(layout) + 1
 		cfg.Plugins.Disabled = append(cfg.Plugins.Disabled, "autopeering")
 		if len(cfgOverrideF) > 0 && cfgOverrideF[0] != nil {
 			cfgOverrideF[0](i, cfg)
@@ -107,17 +123,14 @@ func (f *Framework) CreateStaticNetwork(name string, layout StaticPeeringLayout,
 }
 
 // CreateAutopeeredNetwork creates a network consisting out of peersCount nodes.
-// It waits for the nodes to autopeer until the minimum neighbors criteria is met for every node.
-func (f *Framework) CreateAutopeeredNetwork(name string, peerCount int, minimumNeighbors int, cfgOverrideF ...CfgOverrideFunc) (*AutopeeredNetwork, error) {
+// It waits for the nodes to autopeer until the minimum peers criteria is met for every node.
+func (f *Framework) CreateAutopeeredNetwork(name string, peerCount int, minimumPeers int, cfgOverrideF ...CfgOverrideFunc) (*AutopeeredNetwork, error) {
 	network, err := newNetwork(f.dockerClient, strings.ToLower(name), NetworkTypeAutopeered, f.tester)
 	if err != nil {
 		return nil, err
 	}
 
 	autoNetwork := &AutopeeredNetwork{Network: network}
-	if err := autoNetwork.createEntryNode(); err != nil {
-		return nil, err
-	}
 
 	for i := 0; i < peerCount; i++ {
 		cfg := DefaultConfig()
@@ -139,7 +152,7 @@ func (f *Framework) CreateAutopeeredNetwork(name string, peerCount int, minimumN
 	}
 
 	// await minimum auto. peers
-	if err := autoNetwork.AwaitPeering(minimumNeighbors); err != nil {
+	if err := autoNetwork.AwaitPeering(minimumPeers); err != nil {
 		return nil, err
 	}
 
@@ -147,33 +160,15 @@ func (f *Framework) CreateAutopeeredNetwork(name string, peerCount int, minimumN
 }
 
 // CreateNetworkWithPartitions creates a network consisting out of partitions that contain peerCount nodes per partition.
-// It waits for the peers to autopeer until the minimum neighbors criteria is met for every peer.
+// It waits for the peers to autopeer until the minimum peers criteria is met for every peer.
 // The entry node is reachable by all nodes at all times.
-func (f *Framework) CreateNetworkWithPartitions(name string, peerCount, partitions, minimumNeighbors int, cfgOverrideF ...CfgOverrideFunc) (*AutopeeredNetwork, error) {
+func (f *Framework) CreateNetworkWithPartitions(name string, peerCount, partitions, minimumPeers int, cfgOverrideF ...CfgOverrideFunc) (*AutopeeredNetwork, error) {
 	network, err := newNetwork(f.dockerClient, strings.ToLower(name), NetworkTypeAutopeered, f.tester)
 	if err != nil {
 		return nil, err
 	}
 
 	autoNetwork := &AutopeeredNetwork{Network: network}
-	if err := autoNetwork.createEntryNode(); err != nil {
-		return nil, err
-	}
-
-	// block all traffic from/to entry node
-	log.Println("blocking traffic to entry node...")
-	pumbaEntryNodeName := network.PrefixName(containerNameEntryNode) + containerNameSuffixPumba
-	pumbaEntryNode, err := autoNetwork.createPumba(
-		pumbaEntryNodeName,
-		network.PrefixName(containerNameEntryNode),
-		strslice.StrSlice{},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	// wait until pumba is started and blocks all traffic
-	time.Sleep(5 * time.Second)
 
 	// create peers
 	for i := 0; i < peerCount; i++ {
@@ -213,26 +208,7 @@ func (f *Framework) CreateNetworkWithPartitions(name string, peerCount, partitio
 	// wait until pumba containers are started and block traffic between partitions
 	time.Sleep(5 * time.Second)
 
-	// delete pumba for entry node
-	log.Println("unblocking traffic to entry node...")
-	if err := pumbaEntryNode.Stop(); err != nil {
-		return nil, err
-	}
-
-	logs, err := pumbaEntryNode.Logs()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := createContainerLogFile(pumbaEntryNodeName, logs); err != nil {
-		return nil, err
-	}
-
-	if err := pumbaEntryNode.Remove(); err != nil {
-		return nil, err
-	}
-
-	if err := autoNetwork.AwaitPeering(minimumNeighbors); err != nil {
+	if err := autoNetwork.AwaitPeering(minimumPeers); err != nil {
 		return nil, err
 	}
 

@@ -1,69 +1,74 @@
 package toolset
 
 import (
-	"bufio"
-	"crypto/sha256"
-	"errors"
+	"bytes"
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
+	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh/terminal"
+
+	"github.com/iotaledger/hive.go/configuration"
+
+	"github.com/gohornet/hornet/pkg/basicauth"
+	"github.com/gohornet/hornet/pkg/utils"
 )
 
-func hashPasswordAndSalt(args []string) error {
+func hashPasswordAndSalt(nodeConfig *configuration.Configuration, args []string) error {
 
 	if len(args) > 0 {
-		return errors.New("too many arguments for 'pwdhash'")
+		return fmt.Errorf("too many arguments for '%s'", ToolPwdHash)
 	}
 
-	reader := bufio.NewReader(os.Stdin)
+	var password []byte
 
-	// get terminal state to be able to restore it in case of an interrupt
-	originalTerminalState, err := terminal.GetState(int(syscall.Stdin))
+	passwordEnv, err := utils.LoadStringFromEnvironment("HORNET_TOOL_PASSWORD")
 	if err != nil {
-		return errors.New("failed to get terminal state")
+		// get terminal state to be able to restore it in case of an interrupt
+		originalTerminalState, err := terminal.GetState(int(syscall.Stdin))
+		if err != nil {
+			return errors.New("failed to get terminal state")
+		}
+
+		signalChan := make(chan os.Signal)
+		signal.Notify(signalChan, os.Interrupt)
+		go func() {
+			<-signalChan
+			// reset the terminal to the original state if we receive an interrupt
+			terminal.Restore(int(syscall.Stdin), originalTerminalState)
+			fmt.Println("\naborted... Bye!")
+			os.Exit(1)
+		}()
+
+		fmt.Print("Enter a password: ")
+		password, err = terminal.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return err
+		}
+
+		fmt.Print("\nRe-enter your password: ")
+		passwordReenter, err := terminal.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return err
+		}
+
+		if !bytes.Equal(password, passwordReenter) {
+			return errors.New("re-entered password doesn't match")
+		}
+	} else {
+		password = []byte(passwordEnv)
 	}
 
-	signalChan := make(chan os.Signal)
-	signal.Notify(signalChan, os.Interrupt)
-	go func() {
-		<-signalChan
-		// reset the terminal to the original state if we receive an interrupt
-		terminal.Restore(int(syscall.Stdin), originalTerminalState)
-		fmt.Println("\naborted... Bye!")
-		os.Exit(1)
-	}()
-
-	fmt.Print("Enter a password: ")
-	bytePassword, err := terminal.ReadPassword(0)
+	passwordSalt, err := basicauth.SaltGenerator(32)
 	if err != nil {
 		return err
 	}
-	password := string(bytePassword)
 
-	fmt.Print("\nRe-enter your password: ")
-	bytePasswordReenter, err := terminal.ReadPassword(0)
-	if err != nil {
-		return err
-	}
-	if password != string(bytePasswordReenter) {
-		return errors.New("re-entered password doesn't match")
-	}
+	passwordKey, err := basicauth.GetPasswordKey(password, passwordSalt)
 
-	fmt.Print("\nEnter a salt: ")
-	salt, err := reader.ReadString('\n')
-	if err != nil {
-		return err
-	}
-
-	salt = strings.TrimSuffix(salt, "\n")
-
-	hash := sha256.Sum256(append([]byte(password), []byte(salt)...))
-
-	fmt.Printf("\nSuccess!\nYour hash: %x\nYour salt: %s\n", hash, salt)
+	fmt.Printf("\nSuccess!\nYour hash: %x\nYour salt: %x\n", passwordKey, passwordSalt)
 
 	return nil
 }

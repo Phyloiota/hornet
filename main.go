@@ -1,68 +1,64 @@
 package main
 
 import (
-	"github.com/iotaledger/hive.go/node"
-
-	"github.com/gohornet/hornet/pkg/config"
-	"github.com/gohornet/hornet/pkg/toolset"
-	"github.com/gohornet/hornet/plugins/autopeering"
-	"github.com/gohornet/hornet/plugins/cli"
+	"github.com/gohornet/hornet/core/app"
+	"github.com/gohornet/hornet/core/database"
+	"github.com/gohornet/hornet/core/gossip"
+	"github.com/gohornet/hornet/core/gracefulshutdown"
+	"github.com/gohornet/hornet/core/p2p"
+	"github.com/gohornet/hornet/core/pow"
+	"github.com/gohornet/hornet/core/profile"
+	"github.com/gohornet/hornet/core/protocfg"
+	"github.com/gohornet/hornet/core/snapshot"
+	"github.com/gohornet/hornet/core/tangle"
+	"github.com/gohornet/hornet/pkg/node"
 	"github.com/gohornet/hornet/plugins/coordinator"
-	"github.com/gohornet/hornet/plugins/curl"
 	"github.com/gohornet/hornet/plugins/dashboard"
-	"github.com/gohornet/hornet/plugins/database"
-	"github.com/gohornet/hornet/plugins/gossip"
-	"github.com/gohornet/hornet/plugins/gracefulshutdown"
-	"github.com/gohornet/hornet/plugins/metrics"
+	"github.com/gohornet/hornet/plugins/debug"
+	"github.com/gohornet/hornet/plugins/migrator"
 	"github.com/gohornet/hornet/plugins/mqtt"
-	"github.com/gohornet/hornet/plugins/peering"
-	"github.com/gohornet/hornet/plugins/pow"
+	"github.com/gohornet/hornet/plugins/p2pdisc"
 	"github.com/gohornet/hornet/plugins/profiling"
 	"github.com/gohornet/hornet/plugins/prometheus"
-	"github.com/gohornet/hornet/plugins/snapshot"
+	"github.com/gohornet/hornet/plugins/receipt"
+	"github.com/gohornet/hornet/plugins/restapi"
+	restapiv1 "github.com/gohornet/hornet/plugins/restapi/v1"
 	"github.com/gohornet/hornet/plugins/spammer"
-	"github.com/gohornet/hornet/plugins/tangle"
 	"github.com/gohornet/hornet/plugins/urts"
+	"github.com/gohornet/hornet/plugins/versioncheck"
 	"github.com/gohornet/hornet/plugins/warpsync"
-	"github.com/gohornet/hornet/plugins/webapi"
-	"github.com/gohornet/hornet/plugins/zmq"
 )
 
 func main() {
-	cli.ParseFlags()
-	cli.PrintVersion()
-	cli.ParseConfig()
-	toolset.HandleTools()
-	cli.PrintConfig()
-
-	plugins := []*node.Plugin{
-		cli.PLUGIN,
-		gracefulshutdown.PLUGIN,
-		profiling.PLUGIN,
-		database.PLUGIN,
-		curl.PLUGIN,
-		autopeering.PLUGIN,
-		webapi.PLUGIN,
-	}
-
-	if !config.NodeConfig.GetBool(config.CfgNetAutopeeringRunAsEntryNode) {
-		plugins = append(plugins, []*node.Plugin{
-			pow.PLUGIN,
-			gossip.PLUGIN,
-			tangle.PLUGIN,
-			peering.PLUGIN,
-			warpsync.PLUGIN,
-			urts.PLUGIN,
-			metrics.PLUGIN,
-			snapshot.PLUGIN,
-			dashboard.PLUGIN,
-			zmq.PLUGIN,
-			mqtt.PLUGIN,
-			spammer.PLUGIN,
-			coordinator.PLUGIN,
-			prometheus.PLUGIN,
-		}...)
-	}
-
-	node.Run(node.Plugins(plugins...))
+	node.Run(
+		node.WithInitPlugin(app.InitPlugin),
+		node.WithCorePlugins([]*node.CorePlugin{
+			profile.CorePlugin,
+			protocfg.CorePlugin,
+			gracefulshutdown.CorePlugin,
+			database.CorePlugin,
+			pow.CorePlugin,
+			p2p.CorePlugin,
+			gossip.CorePlugin,
+			tangle.CorePlugin,
+			snapshot.CorePlugin,
+		}...),
+		node.WithPlugins([]*node.Plugin{
+			profiling.Plugin,
+			versioncheck.Plugin,
+			restapi.Plugin,
+			restapiv1.Plugin,
+			p2pdisc.Plugin,
+			warpsync.Plugin,
+			urts.Plugin,
+			dashboard.Plugin,
+			spammer.Plugin,
+			mqtt.Plugin,
+			coordinator.Plugin,
+			migrator.Plugin,
+			receipt.Plugin,
+			prometheus.Plugin,
+			debug.Plugin,
+		}...),
+	)
 }

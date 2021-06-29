@@ -1,238 +1,364 @@
 package mqtt
 
 import (
-	"github.com/iotaledger/iota.go/trinary"
+	"fmt"
+	"net/url"
 
-	"github.com/iotaledger/hive.go/daemon"
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/logger"
-	"github.com/iotaledger/hive.go/node"
-	"github.com/iotaledger/hive.go/workerpool"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"go.uber.org/dig"
 
 	"github.com/gohornet/hornet/pkg/model/milestone"
-	tanglePackage "github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/storage"
+	"github.com/gohornet/hornet/pkg/model/utxo"
+	mqttpkg "github.com/gohornet/hornet/pkg/mqtt"
+	"github.com/gohornet/hornet/pkg/node"
 	"github.com/gohornet/hornet/pkg/shutdown"
-	"github.com/gohornet/hornet/plugins/tangle"
+	"github.com/gohornet/hornet/pkg/tangle"
+	"github.com/gohornet/hornet/plugins/restapi"
+	"github.com/iotaledger/hive.go/configuration"
+	"github.com/iotaledger/hive.go/events"
+	"github.com/iotaledger/hive.go/logger"
+	"github.com/iotaledger/hive.go/workerpool"
+	iotago "github.com/iotaledger/iota.go/v2"
 )
 
-var (
-	// MQTT is disabled by default
-	PLUGIN = node.NewPlugin("MQTT", node.Disabled, configure, run)
-	log    *logger.Logger
-
-	newTxWorkerCount     = 1
-	newTxWorkerQueueSize = 10000
-	newTxWorkerPool      *workerpool.WorkerPool
-
-	confirmedTxWorkerCount     = 1
-	confirmedTxWorkerQueueSize = 10000
-	confirmedTxWorkerPool      *workerpool.WorkerPool
-
-	newLatestMilestoneWorkerCount     = 1
-	newLatestMilestoneWorkerQueueSize = 100
-	newLatestMilestoneWorkerPool      *workerpool.WorkerPool
-
-	newSolidMilestoneWorkerCount     = 1
-	newSolidMilestoneWorkerQueueSize = 100
-	newSolidMilestoneWorkerPool      *workerpool.WorkerPool
-
-	spentAddressWorkerCount     = 1
-	spentAddressWorkerQueueSize = 1000
-	spentAddressWorkerPool      *workerpool.WorkerPool
-
-	wasSyncBefore = false
-
-	mqttBroker *Broker
-)
-
-// Configure the MQTT plugin
-func configure(plugin *node.Plugin) {
-	log = logger.NewLogger(plugin.Name)
-
-	newTxWorkerPool = workerpool.New(func(task workerpool.Task) {
-		onNewTx(task.Param(0).(*tanglePackage.CachedTransaction)) // tx pass +1
-		task.Return(nil)
-	}, workerpool.WorkerCount(newTxWorkerCount), workerpool.QueueSize(newTxWorkerQueueSize), workerpool.FlushTasksAtShutdown(true))
-
-	confirmedTxWorkerPool = workerpool.New(func(task workerpool.Task) {
-		onConfirmedTx(task.Param(0).(*tanglePackage.CachedMetadata), task.Param(1).(milestone.Index), task.Param(2).(int64)) // meta pass +1
-		task.Return(nil)
-	}, workerpool.WorkerCount(confirmedTxWorkerCount), workerpool.QueueSize(confirmedTxWorkerQueueSize), workerpool.FlushTasksAtShutdown(true))
-
-	newLatestMilestoneWorkerPool = workerpool.New(func(task workerpool.Task) {
-		onNewLatestMilestone(task.Param(0).(*tanglePackage.CachedBundle)) // bundle pass +1
-		task.Return(nil)
-	}, workerpool.WorkerCount(newLatestMilestoneWorkerCount), workerpool.QueueSize(newLatestMilestoneWorkerQueueSize), workerpool.FlushTasksAtShutdown(true))
-
-	newSolidMilestoneWorkerPool = workerpool.New(func(task workerpool.Task) {
-		onNewSolidMilestone(task.Param(0).(*tanglePackage.CachedBundle)) // bundle pass +1
-		task.Return(nil)
-	}, workerpool.WorkerCount(newSolidMilestoneWorkerCount), workerpool.QueueSize(newSolidMilestoneWorkerQueueSize), workerpool.FlushTasksAtShutdown(true))
-
-	spentAddressWorkerPool = workerpool.New(func(task workerpool.Task) {
-		onSpentAddress(task.Param(0).(trinary.Hash))
-		task.Return(nil)
-	}, workerpool.WorkerCount(spentAddressWorkerCount), workerpool.QueueSize(spentAddressWorkerQueueSize))
-
-	var err error
-	mqttBroker, err = NewBroker()
-	if err != nil {
-		log.Fatalf("MQTT broker init failed! %v", err)
+func init() {
+	Plugin = &node.Plugin{
+		Status: node.Enabled,
+		Pluggable: node.Pluggable{
+			Name:      "MQTT",
+			DepsFunc:  func(cDeps dependencies) { deps = cDeps },
+			Params:    params,
+			Configure: configure,
+			Run:       run,
+		},
 	}
 }
 
-// Start the MQTT plugin
-func run(plugin *node.Plugin) {
+const (
+	// RouteMQTT is the route for accessing the MQTT over WebSockets.
+	RouteMQTT = "/mqtt"
 
-	log.Infof("Starting MQTT Broker (port %s) ...", mqttBroker.config.Port)
+	workerCount     = 1
+	workerQueueSize = 10000
+)
 
-	onReceivedNewTransaction := events.NewClosure(func(cachedTx *tanglePackage.CachedTransaction, latestMilestoneIndex milestone.Index, latestSolidMilestoneIndex milestone.Index) {
+var (
+	Plugin *node.Plugin
+	log    *logger.Logger
+	deps   dependencies
+
+	newLatestMilestoneWorkerPool    *workerpool.WorkerPool
+	newConfirmedMilestoneWorkerPool *workerpool.WorkerPool
+
+	messagesWorkerPool        *workerpool.WorkerPool
+	messageMetadataWorkerPool *workerpool.WorkerPool
+	utxoOutputWorkerPool      *workerpool.WorkerPool
+	receiptWorkerPool         *workerpool.WorkerPool
+
+	topicSubscriptionWorkerPool *workerpool.WorkerPool
+
+	wasSyncBefore = false
+
+	mqttBroker *mqttpkg.Broker
+)
+
+type dependencies struct {
+	dig.In
+	Storage       *storage.Storage
+	Tangle        *tangle.Tangle
+	NodeConfig    *configuration.Configuration `name:"nodeConfig"`
+	BelowMaxDepth int                          `name:"belowMaxDepth"`
+	Bech32HRP     iotago.NetworkPrefix         `name:"bech32HRP"`
+	Echo          *echo.Echo                   `optional:"true"`
+}
+
+func configure() {
+	log = logger.NewLogger(Plugin.Name)
+
+	// check if RestAPI plugin is disabled
+	if Plugin.Node.IsSkipped(restapi.Plugin) {
+		log.Panic("RestAPI plugin needs to be enabled to use the MQTT plugin")
+	}
+
+	newLatestMilestoneWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishLatestMilestone(task.Param(0).(*storage.CachedMilestone)) // milestone pass +1
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize), workerpool.FlushTasksAtShutdown(true))
+
+	newConfirmedMilestoneWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishConfirmedMilestone(task.Param(0).(*storage.CachedMilestone)) // milestone pass +1
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize), workerpool.FlushTasksAtShutdown(true))
+
+	messagesWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishMessage(task.Param(0).(*storage.CachedMessage)) // metadata pass +1
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize), workerpool.FlushTasksAtShutdown(true))
+
+	messageMetadataWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishMessageMetadata(task.Param(0).(*storage.CachedMetadata)) // metadata pass +1
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize), workerpool.FlushTasksAtShutdown(true))
+
+	utxoOutputWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishOutput(task.Param(0).(milestone.Index), task.Param(1).(*utxo.Output), task.Param(2).(bool))
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize))
+
+	receiptWorkerPool = workerpool.New(func(task workerpool.Task) {
+		publishReceipt(task.Param(0).(*iotago.Receipt))
+		task.Return(nil)
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize))
+
+	topicSubscriptionWorkerPool = workerpool.New(func(task workerpool.Task) {
+		defer task.Return(nil)
+
+		topic := task.Param(0).([]byte)
+		topicName := string(topic)
+
+		if messageId := messageIdFromTopic(topicName); messageId != nil {
+			if cachedMsgMeta := deps.Storage.GetCachedMessageMetadataOrNil(messageId); cachedMsgMeta != nil {
+				if _, added := messageMetadataWorkerPool.TrySubmit(cachedMsgMeta); added {
+					return // Avoid Release (done inside workerpool task)
+				}
+				cachedMsgMeta.Release(true)
+			}
+			return
+		}
+
+		if transactionId := transactionIdFromTopic(topicName); transactionId != nil {
+			// Find the first output of the transaction
+			outputId := &iotago.UTXOInputID{}
+			copy(outputId[:], transactionId[:])
+
+			output, err := deps.Storage.UTXO().ReadOutputByOutputIDWithoutLocking(outputId)
+			if err != nil {
+				return
+			}
+
+			publishTransactionIncludedMessage(transactionId, output.MessageID())
+			return
+		}
+
+		if outputId := outputIdFromTopic(topicName); outputId != nil {
+
+			// we need to lock the ledger here to have the correct index for unspent info of the output.
+			deps.Storage.UTXO().ReadLockLedger()
+			defer deps.Storage.UTXO().ReadUnlockLedger()
+
+			ledgerIndex, err := deps.Storage.UTXO().ReadLedgerIndexWithoutLocking()
+			if err != nil {
+				return
+			}
+
+			output, err := deps.Storage.UTXO().ReadOutputByOutputIDWithoutLocking(outputId)
+			if err != nil {
+				return
+			}
+
+			unspent, err := deps.Storage.UTXO().IsOutputUnspentWithoutLocking(output)
+			if err != nil {
+				return
+			}
+			utxoOutputWorkerPool.TrySubmit(ledgerIndex, output, !unspent)
+			return
+		}
+
+		if topicName == topicMilestonesLatest {
+			index := deps.Storage.GetLatestMilestoneIndex()
+			if milestone := deps.Storage.GetCachedMilestoneOrNil(index); milestone != nil {
+				publishLatestMilestone(milestone) // milestone pass +1
+			}
+			return
+		}
+
+		if topicName == topicMilestonesConfirmed {
+			index := deps.Storage.GetConfirmedMilestoneIndex()
+			if milestone := deps.Storage.GetCachedMilestoneOrNil(index); milestone != nil {
+				publishConfirmedMilestone(milestone) // milestone pass +1
+			}
+			return
+		}
+
+	}, workerpool.WorkerCount(workerCount), workerpool.QueueSize(workerQueueSize), workerpool.FlushTasksAtShutdown(true))
+
+	var err error
+	mqttBroker, err = mqttpkg.NewBroker(deps.NodeConfig.String(CfgMQTTBindAddress), deps.NodeConfig.Int(CfgMQTTWSPort), "/ws", deps.NodeConfig.Int(CfgMQTTWorkerCount), func(topic []byte) {
+		log.Infof("Subscribe to topic: %s", string(topic))
+		topicSubscriptionWorkerPool.TrySubmit(topic)
+	}, func(topic []byte) {
+		log.Infof("Unsubscribe from topic: %s", string(topic))
+	})
+
+	if err != nil {
+		log.Fatalf("MQTT broker init failed! %s", err)
+	}
+
+	setupWebSocketRoute()
+}
+
+func setupWebSocketRoute() {
+
+	// Configure MQTT WebSocket route
+	mqttWSUrl, err := url.Parse(fmt.Sprintf("http://%s:%s", mqttBroker.GetConfig().Host, mqttBroker.GetConfig().WsPort))
+	if err != nil {
+		log.Fatalf("MQTT WebSocket init failed! %s", err)
+	}
+
+	wsGroup := deps.Echo.Group(RouteMQTT)
+	proxyConfig := middleware.ProxyConfig{
+		Skipper: middleware.DefaultSkipper,
+		Balancer: middleware.NewRoundRobinBalancer([]*middleware.ProxyTarget{
+			{
+				URL: mqttWSUrl,
+			},
+		}),
+		// We need to forward any calls to the MQTT route to the ws endpoint of our broker
+		Rewrite: map[string]string{
+			RouteMQTT: mqttBroker.GetConfig().WsPath,
+		},
+	}
+
+	wsGroup.Use(middleware.ProxyWithConfig(proxyConfig))
+}
+
+func run() {
+
+	log.Infof("Starting MQTT Broker (port %s) ...", mqttBroker.GetConfig().Port)
+
+	onLatestMilestoneChanged := events.NewClosure(func(cachedMs *storage.CachedMilestone) {
 		if !wasSyncBefore {
-			if !tanglePackage.IsNodeSyncedWithThreshold() {
-				cachedTx.Release(true) // tx -1
+			// Not sync
+			cachedMs.Release(true)
+			return
+		}
+
+		if _, added := newLatestMilestoneWorkerPool.TrySubmit(cachedMs); added {
+			return // Avoid Release (done inside workerpool task)
+		}
+		cachedMs.Release(true)
+	})
+
+	onConfirmedMilestoneChanged := events.NewClosure(func(cachedMs *storage.CachedMilestone) {
+		if !wasSyncBefore {
+			if !deps.Storage.IsNodeAlmostSynced() {
+				cachedMs.Release(true)
 				return
 			}
 			wasSyncBefore = true
 		}
 
-		if _, added := newTxWorkerPool.TrySubmit(cachedTx); added { // tx pass +1
-			return // Avoid tx -1 (done inside workerpool task)
+		if _, added := newConfirmedMilestoneWorkerPool.TrySubmit(cachedMs); added {
+			return // Avoid Release (done inside workerpool task)
 		}
-		cachedTx.Release(true) // tx -1
+		cachedMs.Release(true)
 	})
 
-	onTransactionConfirmed := events.NewClosure(func(cachedMeta *tanglePackage.CachedMetadata, msIndex milestone.Index, confTime int64) {
+	onReceivedNewMessage := events.NewClosure(func(cachedMsg *storage.CachedMessage, latestMilestoneIndex milestone.Index, confirmedMilestoneIndex milestone.Index) {
 		if !wasSyncBefore {
 			// Not sync
-			cachedMeta.Release(true) // meta -1
-			return
-		}
-		// Avoid notifying for conflicting txs
-		if !cachedMeta.GetMetadata().IsConflicting() {
-			if _, added := confirmedTxWorkerPool.TrySubmit(cachedMeta, msIndex, confTime); added { // meta pass +1
-				return // Avoid meta -1 (done inside workerpool task)
-			}
-		}
-		cachedMeta.Release(true) // meta -1
-	})
-
-	onLatestMilestoneChanged := events.NewClosure(func(cachedBndl *tanglePackage.CachedBundle) {
-		if !wasSyncBefore {
-			// Not sync
-			cachedBndl.Release(true) // bundle -1
+			cachedMsg.Release(true)
 			return
 		}
 
-		if _, added := newLatestMilestoneWorkerPool.TrySubmit(cachedBndl); added { // bundle pass +1
-			return // Avoid bundle -1 (done inside workerpool task)
+		if _, added := messagesWorkerPool.TrySubmit(cachedMsg); added {
+			return // Avoid Release (done inside workerpool task)
 		}
-		cachedBndl.Release(true) // bundle -1
+		cachedMsg.Release(true)
 	})
 
-	onSolidMilestoneChanged := events.NewClosure(func(cachedBndl *tanglePackage.CachedBundle) {
-		if !wasSyncBefore {
-			// Not sync
-			cachedBndl.Release(true) // bundle -1
-			return
+	onMessageSolid := events.NewClosure(func(cachedMetadata *storage.CachedMetadata) {
+		if _, added := messageMetadataWorkerPool.TrySubmit(cachedMetadata); added {
+			return // Avoid Release (done inside workerpool task)
 		}
-
-		if _, added := newSolidMilestoneWorkerPool.TrySubmit(cachedBndl); added { // bundle pass +1
-			return // Avoid bundle -1 (done inside workerpool task)
-		}
-		cachedBndl.Release(true) // bundle -1
+		cachedMetadata.Release(true)
 	})
 
-	onAddressSpent := events.NewClosure(func(addr trinary.Hash) {
-		spentAddressWorkerPool.TrySubmit(addr)
+	onMessageReferenced := events.NewClosure(func(cachedMetadata *storage.CachedMetadata, msIndex milestone.Index, confTime uint64) {
+		if _, added := messageMetadataWorkerPool.TrySubmit(cachedMetadata); added {
+			return // Avoid Release (done inside workerpool task)
+		}
+		cachedMetadata.Release(true)
 	})
 
-	daemon.BackgroundWorker("MQTT Broker", func(shutdownSignal <-chan struct{}) {
+	onUTXOOutput := events.NewClosure(func(index milestone.Index, output *utxo.Output) {
+		utxoOutputWorkerPool.TrySubmit(index, output, false)
+	})
+
+	onUTXOSpent := events.NewClosure(func(index milestone.Index, spent *utxo.Spent) {
+		utxoOutputWorkerPool.TrySubmit(index, spent.Output(), true)
+	})
+
+	onReceipt := events.NewClosure(func(receipt *iotago.Receipt) {
+		receiptWorkerPool.TrySubmit(receipt)
+	})
+
+	Plugin.Daemon().BackgroundWorker("MQTT Broker", func(shutdownSignal <-chan struct{}) {
 		go func() {
-			if err := startBroker(plugin); err != nil {
-				log.Errorf("Stopping MQTT Broker: %s", err.Error())
-			} else {
-				log.Infof("Starting MQTT Broker (port %s) ... done", mqttBroker.config.Port)
-			}
-
+			mqttBroker.Start()
+			log.Infof("Starting MQTT Broker (port %s) ... done", mqttBroker.GetConfig().Port)
 		}()
 
-		if mqttBroker.config.Port != "" {
-			log.Infof("You can now listen to MQTT via: http://%s:%s", mqttBroker.config.Host, mqttBroker.config.Port)
+		if mqttBroker.GetConfig().Port != "" {
+			log.Infof("You can now listen to MQTT via: http://%s:%s", mqttBroker.GetConfig().Host, mqttBroker.GetConfig().Port)
 		}
 
-		if mqttBroker.config.TlsPort != "" {
-			log.Infof("You can now listen to MQTT via: https://%s:%s", mqttBroker.config.TlsHost, mqttBroker.config.TlsPort)
+		if mqttBroker.GetConfig().TlsPort != "" {
+			log.Infof("You can now listen to MQTT via: https://%s:%s", mqttBroker.GetConfig().TlsHost, mqttBroker.GetConfig().TlsPort)
 		}
 
 		<-shutdownSignal
 		log.Info("Stopping MQTT Broker ...")
-
-		if err := mqttBroker.Shutdown(); err != nil {
-			log.Errorf("Stopping MQTT Broker: %s", err.Error())
-		} else {
-			log.Info("Stopping MQTT Broker ... done")
-		}
+		log.Info("Stopping MQTT Broker ... done")
 	}, shutdown.PriorityMetricsPublishers)
 
-	/*
-		daemon.BackgroundWorker("MQTT address topic updater", func(shutdownSignal <-chan struct{}) {
-			timeutil.Ticker(updateAddressTopics, 5*time.Second, shutdownSignal)
-		}, shutdown.PriorityMetricsPublishers)
-	*/
+	Plugin.Daemon().BackgroundWorker("MQTT Events", func(shutdownSignal <-chan struct{}) {
+		log.Info("Starting MQTT Events ... done")
 
-	daemon.BackgroundWorker("MQTT[NewTxWorker]", func(shutdownSignal <-chan struct{}) {
-		log.Info("Starting MQTT[NewTxWorker] ... done")
-		tangle.Events.ReceivedNewTransaction.Attach(onReceivedNewTransaction)
-		newTxWorkerPool.Start()
-		<-shutdownSignal
-		tangle.Events.ReceivedNewTransaction.Detach(onReceivedNewTransaction)
-		newTxWorkerPool.StopAndWait()
-		log.Info("Stopping MQTT[NewTxWorker] ... done")
-	}, shutdown.PriorityMetricsPublishers)
+		deps.Tangle.Events.LatestMilestoneChanged.Attach(onLatestMilestoneChanged)
+		deps.Tangle.Events.ConfirmedMilestoneChanged.Attach(onConfirmedMilestoneChanged)
 
-	daemon.BackgroundWorker("MQTT[ConfirmedTxWorker]", func(shutdownSignal <-chan struct{}) {
-		log.Info("Starting MQTT[ConfirmedTxWorker] ... done")
-		tangle.Events.TransactionConfirmed.Attach(onTransactionConfirmed)
-		confirmedTxWorkerPool.Start()
-		<-shutdownSignal
-		tangle.Events.TransactionConfirmed.Detach(onTransactionConfirmed)
-		confirmedTxWorkerPool.StopAndWait()
-		log.Info("Stopping MQTT[ConfirmedTxWorker] ... done")
-	}, shutdown.PriorityMetricsPublishers)
+		deps.Tangle.Events.ReceivedNewMessage.Attach(onReceivedNewMessage)
+		deps.Tangle.Events.MessageSolid.Attach(onMessageSolid)
+		deps.Tangle.Events.MessageReferenced.Attach(onMessageReferenced)
 
-	daemon.BackgroundWorker("MQTT[NewLatestMilestoneWorker]", func(shutdownSignal <-chan struct{}) {
-		log.Info("Starting MQTT[NewLatestMilestoneWorker] ... done")
-		tangle.Events.LatestMilestoneChanged.Attach(onLatestMilestoneChanged)
+		deps.Tangle.Events.NewUTXOOutput.Attach(onUTXOOutput)
+		deps.Tangle.Events.NewUTXOSpent.Attach(onUTXOSpent)
+
+		deps.Tangle.Events.NewReceipt.Attach(onReceipt)
+
+		messagesWorkerPool.Start()
 		newLatestMilestoneWorkerPool.Start()
+		newConfirmedMilestoneWorkerPool.Start()
+		messageMetadataWorkerPool.Start()
+		topicSubscriptionWorkerPool.Start()
+		utxoOutputWorkerPool.Start()
+		receiptWorkerPool.Start()
+
 		<-shutdownSignal
-		tangle.Events.LatestMilestoneChanged.Detach(onLatestMilestoneChanged)
+
+		deps.Tangle.Events.LatestMilestoneChanged.Detach(onLatestMilestoneChanged)
+		deps.Tangle.Events.ConfirmedMilestoneChanged.Detach(onConfirmedMilestoneChanged)
+
+		deps.Tangle.Events.ReceivedNewMessage.Detach(onReceivedNewMessage)
+		deps.Tangle.Events.MessageSolid.Detach(onMessageSolid)
+		deps.Tangle.Events.MessageReferenced.Detach(onMessageReferenced)
+
+		deps.Tangle.Events.NewUTXOOutput.Detach(onUTXOOutput)
+		deps.Tangle.Events.NewUTXOSpent.Detach(onUTXOSpent)
+
+		deps.Tangle.Events.NewReceipt.Detach(onReceipt)
+
+		messagesWorkerPool.StopAndWait()
 		newLatestMilestoneWorkerPool.StopAndWait()
-		log.Info("Stopping MQTT[NewLatestMilestoneWorker] ... done")
-	}, shutdown.PriorityMetricsPublishers)
+		newConfirmedMilestoneWorkerPool.StopAndWait()
+		messageMetadataWorkerPool.StopAndWait()
+		topicSubscriptionWorkerPool.StopAndWait()
+		utxoOutputWorkerPool.StopAndWait()
+		receiptWorkerPool.StopAndWait()
 
-	daemon.BackgroundWorker("MQTT[NewSolidMilestoneWorker]", func(shutdownSignal <-chan struct{}) {
-		log.Info("Starting MQTT[NewSolidMilestoneWorker] ... done")
-		tangle.Events.SolidMilestoneChanged.Attach(onSolidMilestoneChanged)
-		newSolidMilestoneWorkerPool.Start()
-		<-shutdownSignal
-		tangle.Events.SolidMilestoneChanged.Detach(onSolidMilestoneChanged)
-		newSolidMilestoneWorkerPool.StopAndWait()
-		log.Info("Stopping MQTT[NewSolidMilestoneWorker] ... done")
+		log.Info("Stopping MQTT Events ... done")
 	}, shutdown.PriorityMetricsPublishers)
-
-	daemon.BackgroundWorker("MQTT[SpentAddress]", func(shutdownSignal <-chan struct{}) {
-		log.Info("Starting MQTT[SpentAddress] ... done")
-		tanglePackage.Events.AddressSpent.Attach(onAddressSpent)
-		spentAddressWorkerPool.Start()
-		<-shutdownSignal
-		log.Info("Stopping MQTT[SpentAddress] ...")
-		tanglePackage.Events.AddressSpent.Detach(onAddressSpent)
-		spentAddressWorkerPool.StopAndWait()
-		log.Info("Stopping MQTT[SpentAddress] ... done")
-	}, shutdown.PriorityMetricsPublishers)
-}
-
-// Start the mqtt broker.
-func startBroker(_ *node.Plugin) error {
-	return mqttBroker.Start()
 }

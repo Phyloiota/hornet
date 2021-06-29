@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/rand"
@@ -10,8 +11,8 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	"github.com/iotaledger/hive.go/crypto/ed25519"
-	"github.com/iotaledger/hive.go/identity"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
 
 type NetworkType byte
@@ -23,7 +24,7 @@ const (
 	NetworkTypeStatic
 )
 
-// Network is a network consisting out of Hornet nodes.
+// Network is a network consisting out of HORNET nodes.
 type Network struct {
 	// The ID of the network.
 	ID string
@@ -33,6 +34,8 @@ type Network struct {
 	Name string
 	// The nodes within the network in the order in which they were spawned.
 	Nodes []*Node
+	// The white-flag mock server if one was started.
+	WhiteFlagMockServer *DockerContainer
 	// The tester docker container executing the tests.
 	tester *DockerContainer
 	// The docker client used to communicate with the docker daemon.
@@ -52,7 +55,7 @@ func (n *Network) AwaitOnline(ctx context.Context) error {
 			if err := returnErrIfCtxDone(ctx, ErrNodesNotOnlineInTime); err != nil {
 				return err
 			}
-			if _, err := node.WebAPI.GetNodeInfo(); err != nil {
+			if _, err := node.DebugNodeAPIClient.Info(context.Background()); err != nil {
 				continue
 			}
 			break
@@ -69,11 +72,11 @@ func (n *Network) AwaitAllSync(ctx context.Context) error {
 			if err := returnErrIfCtxDone(ctx, ErrNodesDidNotSyncInTime); err != nil {
 				return err
 			}
-			info, err := node.DebugWebAPI.Info()
+			info, err := node.DebugNodeAPIClient.Info(context.Background())
 			if err != nil {
 				continue
 			}
-			if info.IsSynced {
+			if info.IsHealthy {
 				break
 			}
 		}
@@ -81,33 +84,63 @@ func (n *Network) AwaitAllSync(ctx context.Context) error {
 	return nil
 }
 
-// CreateNode creates a new Hornet node in the network and returns it.
+// CreateWhiteFlagMockServer creates a new white-flag moc kserver in the network.
+func (n *Network) CreateWhiteFlagMockServer(cfg *WhiteFlagMockServerConfig) error {
+	container := NewDockerContainer(n.dockerClient)
+	if err := container.CreateWhiteFlagMockContainer(cfg); err != nil {
+		return err
+	}
+
+	n.WhiteFlagMockServer = container
+
+	if err := container.ConnectToNetwork(n.ID); err != nil {
+		return err
+	}
+
+	if err := container.Start(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CreateNode creates a new HORNET node in the network and returns it.
 func (n *Network) CreateNode(cfg *NodeConfig) (*Node, error) {
 	name := n.PrefixName(fmt.Sprintf("%s%d", containerNameReplica, len(n.Nodes)))
 
 	// create identity
-	publicKey, privateKey, err := ed25519.GenerateKey()
+	privateKey, publicKey, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	if err != nil {
 		return nil, err
 	}
-	seed := privateKey.Seed().String()
+
+	privateKeyBytes, err := privateKey.Raw()
+	if err != nil {
+		return nil, err
+	}
 
 	cfg.Name = name
-	cfg.Network.AutopeeringSeed = seed
+	cfg.Network.IdentityPrivKey = hex.EncodeToString(privateKeyBytes)
 
 	// create Docker container
 	container := NewDockerContainer(n.dockerClient)
-	if err = container.CreateNodeContainer(cfg); err != nil {
+	if err := container.CreateNodeContainer(cfg); err != nil {
 		return nil, err
 	}
-	if err = container.ConnectToNetwork(n.ID); err != nil {
+	if err := container.ConnectToNetwork(n.ID); err != nil {
 		return nil, err
 	}
-	if err = container.Start(); err != nil {
+	if err := container.Start(); err != nil {
 		return nil, err
 	}
 
-	peer, err := newNode(name, identity.New(publicKey), cfg, container, n)
+	// Obtain Peer ID from public key
+	pid, err := peer.IDFromPublicKey(publicKey)
+	if err != nil {
+		return nil, err
+	}
+
+	peer, err := newNode(name, pid, cfg, container, n)
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +201,13 @@ func (n *Network) Shutdown() error {
 	// remove containers
 	for _, p := range n.Nodes {
 		if err := p.Remove(); err != nil {
+			return err
+		}
+	}
+
+	// shutdown mock server in case it runs
+	if n.WhiteFlagMockServer != nil {
+		if err := n.WhiteFlagMockServer.Remove(); err != nil {
 			return err
 		}
 	}
@@ -242,16 +282,18 @@ func (n *Network) TakeHeapSnapshots() error {
 	return profErr
 }
 
-// SpamZeroVal starts spamming zero value transactions on all nodes for the given duration.
-func (n *Network) SpamZeroVal(dur time.Duration, parallelism int, batchSize ...int) error {
-	log.Printf("spamming zero value transactions on all nodes")
+// SpamZeroVal starts spamming zero value messages on all nodes for the given duration.
+func (n *Network) SpamZeroVal(dur time.Duration, parallelism int) error {
+	log.Printf("spamming zero value messages on all nodes")
+
 	var wg sync.WaitGroup
 	wg.Add(len(n.Nodes))
+
 	var spamErr error
 	for _, n := range n.Nodes {
 		go func(n *Node) {
 			defer wg.Done()
-			if _, err := n.Spam(dur, 1, parallelism, batchSize...); err != nil {
+			if _, err := n.Spam(dur, parallelism); err != nil {
 				spamErr = err
 			}
 		}(n)

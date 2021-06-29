@@ -1,11 +1,11 @@
 [Unit]
-Description=Hornet
+Description=HORNET
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 EnvironmentFile=-/etc/default/hornet
-LimitNOFILE=4096
+LimitNOFILE=8192
 StandardOutput=syslog
 StandardError=syslog
 SyslogIdentifier=hornet

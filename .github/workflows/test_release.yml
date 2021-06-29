@@ -2,15 +2,17 @@ name: Test release
 
 on:
   push:
+    paths-ignore:
+      - 'docs/**'
     branches:
-      - master
+      - main
 
 jobs:
   Release:
     name: Test release
     runs-on: [ubuntu-latest]
     container:
-      image: iotmod/goreleaser-cgo-cross-compiler:1.15.5
+      image: gohornet/goreleaser-cgo-cross-compiler:1.16.4
       volumes: [/repo]
 
     steps:

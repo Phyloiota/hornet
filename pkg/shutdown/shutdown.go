@@ -1,32 +1,37 @@
 package shutdown
 
+// Please add the dependencies if you add your own priority here.
+// Otherwise investigating deadlocks at shutdown is much more complicated.
+
 const (
-	PriorityCloseDatabase = iota
-	PriorityFlushToDatabase
-	PriorityRequestsProcessor
-	PriorityTipselection
-	PriorityMilestoneSolidifier
-	PriorityMilestoneProcessor
-	PrioritySolidifierGossip
-	PriorityReceiveTxWorker
-	PriorityCurlHasher
-	PriorityBroadcastQueue
+	PriorityCloseDatabase       = iota // no dependencies
+	PriorityFlushToDatabase            // depends on PriorityCloseDatabase
+	PriorityTipselection               // depends on PriorityFlushToDatabase, triggered by PriorityReceiveTxWorker, PriorityMilestoneSolidifier
+	PriorityMilestoneSolidifier        // depends on PriorityFlushToDatabase, triggered by PriorityReceiveTxWorker, PriorityMilestoneProcessor, PriorityMilestoneSolidifier, PriorityCoordinator, PriorityRestAPI, PriorityWarpSync
+	PriorityMilestoneProcessor         // depends on PriorityFlushToDatabase, PriorityMilestoneSolidifier, triggered by PriorityReceiveTxWorker, PriorityMilestoneSolidifier (searchMissingMilestone)
+	PrioritySolidifierGossip           // depends on PriorityFlushToDatabase, triggered by PriorityReceiveTxWorker
+	PriorityReceiveTxWorker            // triggered by PriorityMessageProcessor
 	PriorityMessageProcessor
-	PriorityPeerSendQueue
-	PriorityPeeringTCPServer
-	PriorityPeerReconnecter
-	PriorityHeartbeats
+	PriorityPeerGossipProtocolWrite
+	PriorityPeerGossipProtocolRead
+	PriorityGossipService
+	PriorityRequestsProcessor // depends on PriorityGossipService
+	PriorityBroadcastQueue    // depends on PriorityGossipService
+	PriorityKademliaDHT
+	PriorityPeerDiscovery
+	PriorityP2PManager
+	PriorityHeartbeats // depends on PriorityGossipService
 	PriorityWarpSync
-	PriorityLocalSnapshots
+	PrioritySnapshots
 	PriorityMetricsUpdater
 	PriorityDashboard
 	PriorityPoWHandler
-	PriorityAPI
+	PriorityRestAPI // depends on PriorityPoWHandler
 	PriorityMetricsPublishers
-	PrioritySpammer
+	PrioritySpammer // depends on PriorityPoWHandler
 	PriorityStatusReport
-	PriorityAutopeering
-	PriorityCoordinator
+	PriorityMigrator
+	PriorityCoordinator // depends on PriorityPoWHandler
 	PriorityUpdateCheck
 	PriorityPrometheus
 )

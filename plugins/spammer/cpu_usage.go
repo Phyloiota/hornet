@@ -1,16 +1,14 @@
 package spammer
 
 import (
-	"errors"
 	"math/rand"
 	"runtime"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/shirou/gopsutil/cpu"
 
-	"github.com/iotaledger/hive.go/daemon"
-
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/common"
 )
 
 const (
@@ -27,7 +25,7 @@ var (
 func cpuUsageUpdater() {
 	go func() {
 		for {
-			if daemon.IsStopped() {
+			if Plugin.Daemon().IsStopped() {
 				return
 			}
 
@@ -81,7 +79,7 @@ func waitForLowerCPUUsage(cpuMaxUsage float64, shutdownSignal <-chan struct{}) e
 
 		select {
 		case <-shutdownSignal:
-			return tangle.ErrOperationAborted
+			return common.ErrOperationAborted
 		default:
 		}
 

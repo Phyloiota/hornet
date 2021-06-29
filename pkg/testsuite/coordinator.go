@@ -1,143 +1,149 @@
 package testsuite
 
 import (
-	"crypto"
 	"fmt"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/iotaledger/iota.go/bundle"
-	"github.com/iotaledger/iota.go/consts"
-
+	"github.com/gohornet/hornet/pkg/keymanager"
 	"github.com/gohornet/hornet/pkg/model/coordinator"
 	"github.com/gohornet/hornet/pkg/model/hornet"
 	"github.com/gohornet/hornet/pkg/model/milestone"
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/storage"
+	"github.com/gohornet/hornet/pkg/model/utxo"
 	"github.com/gohornet/hornet/pkg/testsuite/utils"
 	"github.com/gohornet/hornet/pkg/whiteflag"
-)
-
-const (
-	cooSeed     = "WMC9IZAXFW9WQHSJDFUROTNVZPSCDJAQJCTPPAIDFKHVOGPONPQUGDEGWNLSEPZYXOPKQKGKDDINIVOCY"
-	cooAddress  = "WZZQHXUDONRBBIUBCNGNCULQWMLHW9VWEESGFTMWVDVGDTO9EBFGSQXNYPAAFUOI9WIGALDNTSSGNW9ZC"
-	cooSecLevel = consts.SecurityLevelMedium
-
-	mwm             = 1
-	merkleHashFunc  = crypto.BLAKE2b_512
-	merkleTreeDepth = 10
+	"github.com/iotaledger/iota.go/v2/ed25519"
 )
 
 // configureCoordinator configures a new coordinator with clean state for the tests.
 // the node is initialized, the network is bootstrapped and the first milestone is confirmed.
-func (te *TestEnvironment) configureCoordinator() {
+func (te *TestEnvironment) configureCoordinator(cooPrivateKeys []ed25519.PrivateKey, keyManager *keymanager.KeyManager) {
 
-	storeBundleFunc := func(b bundle.Bundle, isMilestone bool) error {
-		var bndl = make(bundle.Bundle, 0, len(b))
+	storeMessageFunc := func(msg *storage.Message, msIndex ...milestone.Index) error {
+		cachedMessage := te.StoreMessage(msg) // no need to release, since we remember all the messages for later cleanup
 
-		// insert it the reverse way
-		for i := len(b) - 1; i >= 0; i-- {
-			bndl = append(bndl, b[i])
-		}
-
-		ms := te.StoreBundle(bndl, true) // no need to release, since we store all the bundles for later cleanup
-
-		if isMilestone {
-			tangle.SetLatestMilestoneIndex(ms.GetBundle().GetMilestoneIndex())
+		ms := cachedMessage.GetMessage().GetMilestone()
+		if ms != nil {
+			te.storage.SetLatestMilestoneIndex(milestone.Index(ms.Index))
 		}
 
 		return nil
 	}
 
-	te.coo = coordinator.New(cooSeed, cooSecLevel, merkleTreeDepth, mwm, fmt.Sprintf("%s/coordinator.state", te.tempDir), 10, te.powHandler, storeBundleFunc, merkleHashFunc)
-	require.NotNil(te.testState, te.coo)
+	inMemoryEd25519MilestoneSignerProvider := coordinator.NewInMemoryEd25519MilestoneSignerProvider(cooPrivateKeys, keyManager, len(cooPrivateKeys))
 
-	err := te.coo.InitMerkleTree(fmt.Sprintf("%s/pkg/testsuite/assets/coordinator.tree", searchProjectRootFolder()), cooAddress)
-	require.NoError(te.testState, err)
+	coo, err := coordinator.New(
+		te.storage,
+		te.networkID,
+		inMemoryEd25519MilestoneSignerProvider,
+		nil,
+		nil,
+		te.PoWHandler,
+		storeMessageFunc,
+		coordinator.WithStateFilePath(fmt.Sprintf("%s/coordinator.state", te.tempDir)),
+		coordinator.WithMilestoneInterval(time.Duration(10)*time.Second),
+	)
+	require.NoError(te.TestInterface, err)
+	require.NotNil(te.TestInterface, coo)
+	te.coo = coo
 
 	te.coo.InitState(true, 0)
 
 	// save snapshot info
-	tangle.SetSnapshotMilestone(hornet.HashFromAddressTrytes(cooAddress), hornet.NullHashBytes, 0, 0, 0, time.Now().Unix(), false)
+	te.storage.SetSnapshotMilestone(te.networkID, 0, 0, 0, time.Now())
 
-	// configure Milestones
-	tangle.ConfigureMilestones(hornet.HashFromAddressTrytes(cooAddress), int(cooSecLevel), merkleTreeDepth, merkleHashFunc)
+	milestoneMessageID, err := te.coo.Bootstrap()
+	require.NoError(te.TestInterface, err)
 
-	milestoneHash, err := te.coo.Bootstrap()
-	require.NoError(te.testState, err)
+	te.lastMilestoneMessageID = milestoneMessageID
 
-	te.lastMilestoneHash = milestoneHash
+	ms := te.storage.GetCachedMilestoneOrNil(1)
+	require.NotNil(te.TestInterface, ms)
 
-	ms := tangle.GetMilestoneOrNil(1)
-	require.NotNil(te.testState, ms)
-	defer ms.Release(true)
+	te.Milestones = append(te.Milestones, ms)
 
-	cachedTxMetas := make(map[string]*tangle.CachedMetadata)
+	messagesMemcache := storage.NewMessagesMemcache(te.storage)
+	metadataMemcache := storage.NewMetadataMemcache(te.storage)
 
 	defer func() {
-		// all releases are forced since the cone is confirmed and not needed anymore
+		// all releases are forced since the cone is referenced and not needed anymore
 
-		// release all tx metadata at the end
-		for _, cachedTxMeta := range cachedTxMetas {
-			cachedTxMeta.Release(true) // meta -1
-		}
+		// release all messages at the end
+		messagesMemcache.Cleanup(true)
+
+		// Release all message metadata at the end
+		metadataMemcache.Cleanup(true)
 	}()
 
-	conf, err := whiteflag.ConfirmMilestone(cachedTxMetas, ms.Retain(), func(txMeta *tangle.CachedMetadata, index milestone.Index, confTime int64) {}, func(confirmation *whiteflag.Confirmation) {
-		tangle.SetSolidMilestoneIndex(confirmation.MilestoneIndex, true)
-	})
-	require.NoError(te.testState, err)
-	require.Equal(te.testState, 3, conf.TxsConfirmed)
+	confirmedMilestoneStats, _, err := whiteflag.ConfirmMilestone(te.storage, te.serverMetrics, messagesMemcache, metadataMemcache, ms.GetMilestone().MessageID,
+		func(txMeta *storage.CachedMetadata, index milestone.Index, confTime uint64) {},
+		func(confirmation *whiteflag.Confirmation) {
+			te.storage.SetConfirmedMilestoneIndex(confirmation.MilestoneIndex, true)
+		},
+		func(index milestone.Index, output *utxo.Output) {},
+		func(index milestone.Index, spent *utxo.Spent) {},
+		nil,
+	)
+	require.NoError(te.TestInterface, err)
+	require.Equal(te.TestInterface, 1, confirmedMilestoneStats.MessagesReferenced)
 }
 
-// IssueAndConfirmMilestoneOnTip creates a milestone on top of a given tip.
-func (te *TestEnvironment) IssueAndConfirmMilestoneOnTip(tip hornet.Hash, createConfirmationGraph bool) *whiteflag.ConfirmedMilestoneStats {
+// IssueAndConfirmMilestoneOnTips creates a milestone on top of the given tips.
+func (te *TestEnvironment) IssueAndConfirmMilestoneOnTips(tips hornet.MessageIDs, createConfirmationGraph bool) (*whiteflag.Confirmation, *whiteflag.ConfirmedMilestoneStats) {
 
-	currentIndex := tangle.GetSolidMilestoneIndex()
+	currentIndex := te.storage.GetConfirmedMilestoneIndex()
 	te.VerifyLMI(currentIndex)
 
 	fmt.Printf("Issue milestone %v\n", currentIndex+1)
-	milestoneHash, noncriticalErr, criticalErr := te.coo.IssueMilestone(te.lastMilestoneHash, tip)
-	require.NoError(te.testState, noncriticalErr)
-	require.NoError(te.testState, criticalErr)
-	te.lastMilestoneHash = milestoneHash
+
+	milestoneMessageID, err := te.coo.IssueMilestone(append(tips, te.lastMilestoneMessageID))
+	require.NoError(te.TestInterface, err)
+	te.lastMilestoneMessageID = milestoneMessageID
 
 	te.VerifyLMI(currentIndex + 1)
 
 	milestoneIndex := currentIndex + 1
-	ms := tangle.GetMilestoneOrNil(milestoneIndex)
-	require.NotNil(te.testState, ms)
+	ms := te.storage.GetCachedMilestoneOrNil(milestoneIndex)
+	require.NotNil(te.TestInterface, ms)
 
-	cachedTxMetas := make(map[string]*tangle.CachedMetadata)
+	messagesMemcache := storage.NewMessagesMemcache(te.storage)
+	metadataMemcache := storage.NewMetadataMemcache(te.storage)
 
 	defer func() {
-		// All releases are forced since the cone is confirmed and not needed anymore
+		// all releases are forced since the cone is referenced and not needed anymore
 
-		// Release all tx metadata at the end
-		for _, cachedTxMeta := range cachedTxMetas {
-			cachedTxMeta.Release(true) // meta -1
-		}
+		// release all messages at the end
+		messagesMemcache.Cleanup(true)
+
+		// Release all message metadata at the end
+		metadataMemcache.Cleanup(true)
 	}()
 
 	var wfConf *whiteflag.Confirmation
-	confStats, err := whiteflag.ConfirmMilestone(cachedTxMetas, ms.Retain(), func(txMeta *tangle.CachedMetadata, index milestone.Index, confTime int64) {}, func(confirmation *whiteflag.Confirmation) {
-		wfConf = confirmation
-		tangle.SetSolidMilestoneIndex(confirmation.MilestoneIndex, true)
-	})
-	require.NoError(te.testState, err)
+	confirmedMilestoneStats, _, err := whiteflag.ConfirmMilestone(te.storage, te.serverMetrics, messagesMemcache, metadataMemcache, ms.GetMilestone().MessageID,
+		func(txMeta *storage.CachedMetadata, index milestone.Index, confTime uint64) {},
+		func(confirmation *whiteflag.Confirmation) {
+			wfConf = confirmation
+			te.storage.SetConfirmedMilestoneIndex(confirmation.MilestoneIndex, true)
+		},
+		func(index milestone.Index, output *utxo.Output) {},
+		func(index milestone.Index, spent *utxo.Spent) {},
+		nil,
+	)
+	require.NoError(te.TestInterface, err)
 
-	require.Equal(te.testState, currentIndex+1, confStats.Index)
-	te.VerifyLSMI(confStats.Index)
-
-	te.cachedBundles = append(te.cachedBundles, ms)
+	require.Equal(te.TestInterface, currentIndex+1, confirmedMilestoneStats.Index)
+	te.VerifyCMI(confirmedMilestoneStats.Index)
 
 	te.AssertTotalSupplyStillValid()
 
 	if createConfirmationGraph {
 		dotFileContent := te.generateDotFileFromConfirmation(wfConf)
 		if te.showConfirmationGraphs {
-			dotFilePath := fmt.Sprintf("%s/%s_%d.png", te.tempDir, te.testState.Name(), confStats.Index)
-			utils.ShowDotFile(te.testState, dotFileContent, dotFilePath)
+			dotFilePath := fmt.Sprintf("%s/%s_%d.png", te.tempDir, te.TestInterface.Name(), confirmedMilestoneStats.Index)
+			utils.ShowDotFile(te.TestInterface, dotFileContent, dotFilePath)
 		} else {
 			fmt.Println(dotFileContent)
 		}
@@ -145,5 +151,5 @@ func (te *TestEnvironment) IssueAndConfirmMilestoneOnTip(tip hornet.Hash, create
 
 	te.Milestones = append(te.Milestones, ms)
 
-	return confStats
+	return wfConf, confirmedMilestoneStats
 }

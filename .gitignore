@@ -11,11 +11,9 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Project files
-.idea
-
 # IDE related files
 .vscode/
+.idea/
 
 # dist packages
 dist/
@@ -25,10 +23,12 @@ dist/
 /hornet
 
 # Database directory
-mainnetdb/
-comnetdb/
-devnetdb/
-alphanetdb/
+privatedb*/
+comnetdb*/
+devnetdb*/
+testnetdb*/
+mainnetdb*/
+p2pstore*/
 
 # snapshot dir
 snapshots/
@@ -40,5 +40,7 @@ integration-tests/logs/*.html
 integration-tests/logs/*.profile
 
 # coordinator files
-coordinator.tree
 coordinator.state
+
+# Docs
+book

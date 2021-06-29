@@ -8,77 +8,57 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/host"
+	"go.uber.org/dig"
 
-	"github.com/iotaledger/hive.go/daemon"
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/logger"
-	"github.com/iotaledger/hive.go/node"
-	"github.com/iotaledger/hive.go/websockethub"
-
+	"github.com/gohornet/hornet/core/database"
+	"github.com/gohornet/hornet/pkg/app"
 	"github.com/gohornet/hornet/pkg/basicauth"
-	"github.com/gohornet/hornet/pkg/config"
+	"github.com/gohornet/hornet/pkg/jwt"
 	"github.com/gohornet/hornet/pkg/metrics"
 	"github.com/gohornet/hornet/pkg/model/hornet"
 	"github.com/gohornet/hornet/pkg/model/milestone"
-	"github.com/gohornet/hornet/pkg/model/tangle"
-	"github.com/gohornet/hornet/pkg/peering/peer"
-	"github.com/gohornet/hornet/pkg/protocol/sting"
+	"github.com/gohornet/hornet/pkg/model/storage"
+	"github.com/gohornet/hornet/pkg/node"
+	"github.com/gohornet/hornet/pkg/p2p"
+	"github.com/gohornet/hornet/pkg/protocol/gossip"
+	restapipkg "github.com/gohornet/hornet/pkg/restapi"
 	"github.com/gohornet/hornet/pkg/shutdown"
-	"github.com/gohornet/hornet/plugins/autopeering"
-	"github.com/gohornet/hornet/plugins/cli"
-	"github.com/gohornet/hornet/plugins/gossip"
-	metricsplugin "github.com/gohornet/hornet/plugins/metrics"
-	"github.com/gohornet/hornet/plugins/peering"
-	tangleplugin "github.com/gohornet/hornet/plugins/tangle"
+	"github.com/gohornet/hornet/pkg/tangle"
+	"github.com/gohornet/hornet/pkg/tipselect"
+	"github.com/gohornet/hornet/plugins/restapi"
+	restapiv1 "github.com/gohornet/hornet/plugins/restapi/v1"
+	"github.com/iotaledger/hive.go/configuration"
+	"github.com/iotaledger/hive.go/events"
+	"github.com/iotaledger/hive.go/logger"
+	"github.com/iotaledger/hive.go/websockethub"
 )
 
-const (
-	// MsgTypeSyncStatus is the type of the SyncStatus message.
-	MsgTypeSyncStatus byte = iota
-	// MsgTypeNodeStatus is the type of the NodeStatus message.
-	MsgTypeNodeStatus
-	// MsgTypeTPSMetric is the type of the transactions per second (TPS) metric message.
-	MsgTypeTPSMetric
-	// MsgTypeTipSelMetric is the type of the TipSelMetric message.
-	MsgTypeTipSelMetric
-	// MsgTypeTxZeroValue is the type of the zero value Tx message.
-	MsgTypeTxZeroValue
-	// MsgTypeTxValue is the type of the value Tx message.
-	MsgTypeTxValue
-	// MsgTypeMs is the type of the Ms message.
-	MsgTypeMs
-	// MsgTypePeerMetric is the type of the PeerMetric message.
-	MsgTypePeerMetric
-	// MsgTypeConfirmedMsMetrics is the type of the ConfirmedMsMetrics message.
-	MsgTypeConfirmedMsMetrics
-	// MsgTypeVertex is the type of the Vertex message for the visualizer.
-	MsgTypeVertex
-	// MsgTypeSolidInfo is the type of the SolidInfo message for the visualizer.
-	MsgTypeSolidInfo
-	// MsgTypeConfirmedInfo is the type of the ConfirmedInfo message for the visualizer.
-	MsgTypeConfirmedInfo
-	// MsgTypeMilestoneInfo is the type of the MilestoneInfo message for the visualizer.
-	MsgTypeMilestoneInfo
-	// MsgTypeTipInfo is the type of the TipInfo message for the visualizer.
-	MsgTypeTipInfo
-	// MsgTypeDatabaseSizeMetric is the type of the database Size message for the metrics.
-	MsgTypeDatabaseSizeMetric
-	// MsgTypeDatabaseCleanupEvent is the type of the database cleanup message for the metrics.
-	MsgTypeDatabaseCleanupEvent
-	// MsgTypeSpamMetrics is the type of the SpamMetric message.
-	MsgTypeSpamMetrics
-	// MsgTypeAvgSpamMetrics is the type of the AvgSpamMetric message.
-	MsgTypeAvgSpamMetrics
-)
+func init() {
+	Plugin = &node.Plugin{
+		Status: node.Enabled,
+		Pluggable: node.Pluggable{
+			Name:      "Dashboard",
+			DepsFunc:  func(cDeps dependencies) { deps = cDeps },
+			Params:    params,
+			Provide:   provide,
+			Configure: configure,
+			Run:       run,
+		},
+	}
+}
 
 const (
-	broadcastQueueSize    = 20000
-	clientSendChannelSize = 1000
+	broadcastQueueSize      = 20000
+	clientSendChannelSize   = 1000
+	maxWebsocketMessageSize = 400
 )
 
 var (
-	PLUGIN = node.NewPlugin("Dashboard", node.Enabled, configure, run)
+	Plugin *node.Plugin
 	log    *logger.Logger
+	deps   dependencies
 
 	nodeStartAt = time.Now()
 
@@ -87,11 +67,55 @@ var (
 	hub      *websockethub.Hub
 	upgrader *websocket.Upgrader
 
-	cachedMilestoneMetrics []*tangleplugin.ConfirmedMilestoneMetric
+	basicAuth *basicauth.BasicAuth
+	jwtAuth   *jwt.JWTAuth
+
+	cachedMilestoneMetrics []*tangle.ConfirmedMilestoneMetric
 )
 
-func configure(plugin *node.Plugin) {
-	log = logger.NewLogger(plugin.Name)
+type dependencies struct {
+	dig.In
+	Storage                  *storage.Storage
+	Tangle                   *tangle.Tangle
+	ServerMetrics            *metrics.ServerMetrics
+	RequestQueue             gossip.RequestQueue
+	Manager                  *p2p.Manager
+	MessageProcessor         *gossip.MessageProcessor
+	TipSelector              *tipselect.TipSelector       `optional:"true"`
+	NodeConfig               *configuration.Configuration `name:"nodeConfig"`
+	AppInfo                  *app.AppInfo
+	Host                     host.Host
+	NodePrivateKey           crypto.PrivKey
+	DatabaseEvents           *database.Events
+	DashboardAllowedAPIRoute restapipkg.AllowedRoute `optional:"true"`
+}
+
+func provide(c *dig.Container) {
+
+	type configdeps struct {
+		dig.In
+		NodeConfig *configuration.Configuration `name:"nodeConfig"`
+	}
+
+	if err := c.Provide(func(deps configdeps) string {
+		return deps.NodeConfig.String(CfgDashboardAuthUsername)
+	}, dig.Name("dashboardAuthUsername")); err != nil {
+		panic(err)
+	}
+}
+
+func configure() {
+	log = logger.NewLogger(Plugin.Name)
+
+	// check if RestAPI plugin is disabled
+	if Plugin.Node.IsSkipped(restapi.Plugin) {
+		log.Panic("RestAPI plugin needs to be enabled to use the Dashboard plugin")
+	}
+
+	// check if RestAPIV1 plugin is disabled
+	if Plugin.Node.IsSkipped(restapiv1.Plugin) {
+		log.Panic("RestAPIV1 plugin needs to be enabled to use the Dashboard plugin")
+	}
 
 	upgrader = &websocket.Upgrader{
 		HandshakeTimeout:  webSocketWriteTimeout,
@@ -99,50 +123,39 @@ func configure(plugin *node.Plugin) {
 		EnableCompression: true,
 	}
 
-	hub = websockethub.NewHub(log, upgrader, broadcastQueueSize, clientSendChannelSize)
+	hub = websockethub.NewHub(log, upgrader, broadcastQueueSize, clientSendChannelSize, maxWebsocketMessageSize)
+
+	basicAuth = basicauth.NewBasicAuth(deps.NodeConfig.String(CfgDashboardAuthUsername),
+		deps.NodeConfig.String(CfgDashboardAuthPasswordHash),
+		deps.NodeConfig.String(CfgDashboardAuthPasswordSalt))
+
+	jwtAuth = jwt.NewJWTAuth(
+		deps.NodeConfig.String(CfgDashboardAuthUsername),
+		deps.NodeConfig.Duration(CfgDashboardAuthSessionTimeout),
+		deps.Host.ID().String(),
+		deps.NodePrivateKey,
+	)
 }
 
-func run(_ *node.Plugin) {
+func run() {
 
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover())
 
-	if config.NodeConfig.GetBool(config.CfgDashboardBasicAuthEnabled) {
-		// grab auth info
-		expectedUsername := config.NodeConfig.GetString(config.CfgDashboardBasicAuthUsername)
-		expectedPasswordHash := config.NodeConfig.GetString(config.CfgDashboardBasicAuthPasswordHash)
-		passwordSalt := config.NodeConfig.GetString(config.CfgDashboardBasicAuthPasswordSalt)
-
-		if len(expectedUsername) == 0 {
-			log.Fatalf("'%s' must not be empty if dashboard basic auth is enabled", config.CfgDashboardBasicAuthUsername)
-		}
-
-		if len(expectedPasswordHash) != 64 {
-			log.Fatalf("'%s' must be 64 (sha256 hash) in length if dashboard basic auth is enabled", config.CfgDashboardBasicAuthPasswordHash)
-		}
-
-		e.Use(middleware.BasicAuth(func(username, password string, c echo.Context) (bool, error) {
-			if username == expectedUsername &&
-				basicauth.VerifyPassword(password, passwordSalt, expectedPasswordHash) {
-				return true, nil
-			}
-			return false, nil
-		}))
-	}
-
 	setupRoutes(e)
-	bindAddr := config.NodeConfig.GetString(config.CfgDashboardBindAddress)
+	bindAddr := deps.NodeConfig.String(CfgDashboardBindAddress)
 	log.Infof("You can now access the dashboard using: http://%s", bindAddr)
 	go e.Start(bindAddr)
 
-	onTPSMetricsUpdated := events.NewClosure(func(tpsMetrics *metricsplugin.TPSMetrics) {
-		hub.BroadcastMsg(&Msg{Type: MsgTypeTPSMetric, Data: tpsMetrics})
+	onMPSMetricsUpdated := events.NewClosure(func(mpsMetrics *tangle.MPSMetrics) {
+		hub.BroadcastMsg(&Msg{Type: MsgTypeMPSMetric, Data: mpsMetrics})
+		hub.BroadcastMsg(&Msg{Type: MsgTypePublicNodeStatus, Data: currentPublicNodeStatus()})
 		hub.BroadcastMsg(&Msg{Type: MsgTypeNodeStatus, Data: currentNodeStatus()})
 		hub.BroadcastMsg(&Msg{Type: MsgTypePeerMetric, Data: peerMetrics()})
 	})
 
-	onSolidMilestoneIndexChanged := events.NewClosure(func(msIndex milestone.Index) {
+	onConfirmedMilestoneIndexChanged := events.NewClosure(func(msIndex milestone.Index) {
 		hub.BroadcastMsg(&Msg{Type: MsgTypeSyncStatus, Data: currentSyncStatus()})
 	})
 
@@ -150,50 +163,54 @@ func run(_ *node.Plugin) {
 		hub.BroadcastMsg(&Msg{Type: MsgTypeSyncStatus, Data: currentSyncStatus()})
 	})
 
-	onNewConfirmedMilestoneMetric := events.NewClosure(func(metric *tangleplugin.ConfirmedMilestoneMetric) {
+	onNewConfirmedMilestoneMetric := events.NewClosure(func(metric *tangle.ConfirmedMilestoneMetric) {
 		cachedMilestoneMetrics = append(cachedMilestoneMetrics, metric)
 		if len(cachedMilestoneMetrics) > 20 {
 			cachedMilestoneMetrics = cachedMilestoneMetrics[len(cachedMilestoneMetrics)-20:]
 		}
-		hub.BroadcastMsg(&Msg{Type: MsgTypeConfirmedMsMetrics, Data: []*tangleplugin.ConfirmedMilestoneMetric{metric}})
+		hub.BroadcastMsg(&Msg{Type: MsgTypeConfirmedMsMetrics, Data: []*tangle.ConfirmedMilestoneMetric{metric}})
 	})
 
-	daemon.BackgroundWorker("Dashboard[WSSend]", func(shutdownSignal <-chan struct{}) {
+	Plugin.Daemon().BackgroundWorker("Dashboard[WSSend]", func(shutdownSignal <-chan struct{}) {
 		go hub.Run(shutdownSignal)
-		metricsplugin.Events.TPSMetricsUpdated.Attach(onTPSMetricsUpdated)
-		tangleplugin.Events.SolidMilestoneIndexChanged.Attach(onSolidMilestoneIndexChanged)
-		tangleplugin.Events.LatestMilestoneIndexChanged.Attach(onLatestMilestoneIndexChanged)
-		tangleplugin.Events.NewConfirmedMilestoneMetric.Attach(onNewConfirmedMilestoneMetric)
+		deps.Tangle.Events.MPSMetricsUpdated.Attach(onMPSMetricsUpdated)
+		deps.Tangle.Events.ConfirmedMilestoneIndexChanged.Attach(onConfirmedMilestoneIndexChanged)
+		deps.Tangle.Events.LatestMilestoneIndexChanged.Attach(onLatestMilestoneIndexChanged)
+		deps.Tangle.Events.NewConfirmedMilestoneMetric.Attach(onNewConfirmedMilestoneMetric)
 		<-shutdownSignal
 		log.Info("Stopping Dashboard[WSSend] ...")
-		metricsplugin.Events.TPSMetricsUpdated.Detach(onTPSMetricsUpdated)
-		tangleplugin.Events.SolidMilestoneIndexChanged.Detach(onSolidMilestoneIndexChanged)
-		tangleplugin.Events.LatestMilestoneIndexChanged.Detach(onLatestMilestoneIndexChanged)
-		tangleplugin.Events.NewConfirmedMilestoneMetric.Detach(onNewConfirmedMilestoneMetric)
+		deps.Tangle.Events.MPSMetricsUpdated.Detach(onMPSMetricsUpdated)
+		deps.Tangle.Events.ConfirmedMilestoneIndexChanged.Detach(onConfirmedMilestoneIndexChanged)
+		deps.Tangle.Events.LatestMilestoneIndexChanged.Detach(onLatestMilestoneIndexChanged)
+		deps.Tangle.Events.NewConfirmedMilestoneMetric.Detach(onNewConfirmedMilestoneMetric)
 
 		log.Info("Stopping Dashboard[WSSend] ... done")
 	}, shutdown.PriorityDashboard)
 
 	// run the message live feed
 	runLiveFeed()
-	// run the visualizer transaction feed
+	// run the visualizer message feed
 	runVisualizer()
-	// run the tipselection feed
-	runTipSelMetricWorker()
+
+	if deps.TipSelector != nil {
+		// run the tipselection feed
+		runTipSelMetricWorker()
+	}
+
 	// run the database size collector
 	runDatabaseSizeCollector()
 	// run the spammer feed
 	runSpammerMetricWorker()
 }
 
-func getMilestoneTailHash(index milestone.Index) hornet.Hash {
-	cachedMs := tangle.GetMilestoneOrNil(index) // bundle +1
+func getMilestoneMessageID(index milestone.Index) hornet.MessageID {
+	cachedMs := deps.Storage.GetMilestoneCachedMessageOrNil(index) // message +1
 	if cachedMs == nil {
 		return nil
 	}
-	defer cachedMs.Release(true) // bundle -1
+	defer cachedMs.Release(true) // message -1
 
-	return cachedMs.GetBundle().GetTailHash()
+	return cachedMs.GetMessage().GetMessageID()
 }
 
 // Msg represents a websocket message.
@@ -202,33 +219,32 @@ type Msg struct {
 	Data interface{} `json:"data"`
 }
 
-// LivefeedTransaction represents a transaction for the livefeed.
-type LivefeedTransaction struct {
-	Hash  string `json:"hash"`
-	Value int64  `json:"value"`
-}
-
 // LivefeedMilestone represents a milestone for the livefeed.
 type LivefeedMilestone struct {
-	Hash  string          `json:"hash"`
-	Index milestone.Index `json:"index"`
+	MessageID string          `json:"messageID"`
+	Index     milestone.Index `json:"index"`
 }
 
 // SyncStatus represents the node sync status.
 type SyncStatus struct {
-	LSMI milestone.Index `json:"lsmi"`
-	LMI  milestone.Index `json:"lmi"`
+	CMI milestone.Index `json:"cmi"`
+	LMI milestone.Index `json:"lmi"`
+}
+
+// PublicNodeStatus represents the public node status.
+type PublicNodeStatus struct {
+	SnapshotIndex milestone.Index `json:"snapshot_index"`
+	PruningIndex  milestone.Index `json:"pruning_index"`
+	IsHealthy     bool            `json:"is_healthy"`
+	IsSynced      bool            `json:"is_synced"`
 }
 
 // NodeStatus represents the node status.
 type NodeStatus struct {
-	SnapshotIndex          milestone.Index `json:"snapshot_index"`
-	PruningIndex           milestone.Index `json:"pruning_index"`
-	IsHealthy              bool            `json:"is_healthy"`
 	Version                string          `json:"version"`
 	LatestVersion          string          `json:"latest_version"`
 	Uptime                 int64           `json:"uptime"`
-	AutopeeringID          string          `json:"autopeering_id"`
+	NodeID                 string          `json:"node_id"`
 	NodeAlias              string          `json:"node_alias"`
 	ConnectedPeersCount    int             `json:"connected_peers_count"`
 	CurrentRequestedMs     milestone.Index `json:"current_requested_ms"`
@@ -243,23 +259,21 @@ type NodeStatus struct {
 
 // ServerMetrics are global metrics of the server.
 type ServerMetrics struct {
-	NumberOfAllTransactions        uint32 `json:"all_txs"`
-	NumberOfNewTransactions        uint32 `json:"new_txs"`
-	NumberOfKnownTransactions      uint32 `json:"known_txs"`
-	NumberOfInvalidTransactions    uint32 `json:"invalid_txs"`
-	NumberOfInvalidRequests        uint32 `json:"invalid_req"`
-	NumberOfStaleTransactions      uint32 `json:"stale_txs"`
-	NumberOfReceivedTransactionReq uint32 `json:"rec_tx_req"`
-	NumberOfReceivedMilestoneReq   uint32 `json:"rec_ms_req"`
-	NumberOfReceivedHeartbeats     uint32 `json:"rec_heartbeat"`
-	NumberOfSentTransactions       uint32 `json:"sent_txs"`
-	NumberOfSentTransactionsReq    uint32 `json:"sent_tx_req"`
-	NumberOfSentMilestoneReq       uint32 `json:"sent_ms_req"`
-	NumberOfSentHeartbeats         uint32 `json:"sent_heartbeat"`
-	NumberOfDroppedSentPackets     uint32 `json:"dropped_sent_packets"`
-	NumberOfSentSpamTxsCount       uint32 `json:"sent_spam_txs"`
-	NumberOfValidatedBundles       uint32 `json:"validated_bundles"`
-	NumberOfSeenSpentAddr          uint32 `json:"spent_addr"`
+	AllMessages          uint32 `json:"all_msgs"`
+	NewMessages          uint32 `json:"new_msgs"`
+	KnownMessages        uint32 `json:"known_msgs"`
+	InvalidMessages      uint32 `json:"invalid_msgs"`
+	InvalidRequests      uint32 `json:"invalid_req"`
+	ReceivedMessageReq   uint32 `json:"rec_msg_req"`
+	ReceivedMilestoneReq uint32 `json:"rec_ms_req"`
+	ReceivedHeartbeats   uint32 `json:"rec_heartbeat"`
+	SentMessages         uint32 `json:"sent_msgs"`
+	SentMessageReq       uint32 `json:"sent_msg_req"`
+	SentMilestoneReq     uint32 `json:"sent_ms_req"`
+	SentHeartbeats       uint32 `json:"sent_heartbeat"`
+	DroppedSentPackets   uint32 `json:"dropped_sent_packets"`
+	SentSpamMsgsCount    uint32 `json:"sent_spam_messages"`
+	ValidatedMessages    uint32 `json:"validated_messages"`
 }
 
 // MemMetrics represents memory metrics.
@@ -277,29 +291,13 @@ type MemMetrics struct {
 	LastPauseGC  uint64 `json:"last_pause_gc"`
 }
 
-// PeerMetric represents metrics of a peer.
-type PeerMetric struct {
-	Identity         string                `json:"identity"`
-	Alias            string                `json:"alias,omitempty"`
-	OriginAddr       string                `json:"origin_addr"`
-	ConnectionOrigin peer.ConnectionOrigin `json:"connection_origin"`
-	ProtocolVersion  byte                  `json:"protocol_version"`
-	BytesRead        uint64                `json:"bytes_read"`
-	BytesWritten     uint64                `json:"bytes_written"`
-	Heartbeat        *sting.Heartbeat      `json:"heartbeat"`
-	Info             *peer.Info            `json:"info"`
-	Connected        bool                  `json:"connected"`
-}
-
 // CachesMetric represents cache metrics.
 type CachesMetric struct {
-	RequestQueue                 Cache `json:"request_queue"`
-	Approvers                    Cache `json:"approvers"`
-	Bundles                      Cache `json:"bundles"`
-	Milestones                   Cache `json:"milestones"`
-	SpentAddresses               Cache `json:"spent_addresses"`
-	Transactions                 Cache `json:"transactions"`
-	IncomingTransactionWorkUnits Cache `json:"incoming_transaction_work_units"`
+	RequestQueue             Cache `json:"request_queue"`
+	Children                 Cache `json:"children"`
+	Milestones               Cache `json:"milestones"`
+	Messages                 Cache `json:"messages"`
+	IncomingMessageWorkUnits Cache `json:"incoming_message_work_units"`
 }
 
 // Cache represents metrics about a cache.
@@ -307,33 +305,32 @@ type Cache struct {
 	Size int `json:"size"`
 }
 
-func peerMetrics() []*PeerMetric {
-	infos := peering.Manager().PeerInfos()
-	var stats []*PeerMetric
-	for _, info := range infos {
-		m := &PeerMetric{
-			OriginAddr: info.DomainWithPort,
-			Info:       info,
-		}
-		if info.Peer != nil && info.Peer.Protocol != nil {
-			m.Identity = info.Peer.ID
-			m.Alias = info.Alias
-			m.ConnectionOrigin = info.Peer.ConnectionOrigin
-			m.ProtocolVersion = info.Peer.Protocol.FeatureSet
-			m.BytesRead = info.Peer.Conn.BytesRead()
-			m.BytesWritten = info.Peer.Conn.BytesWritten()
-			m.Heartbeat = info.Peer.LatestHeartbeat
-			m.Connected = info.Connected
-		} else {
-			m.Identity = info.Address
-		}
-		stats = append(stats, m)
+func peerMetrics() []*restapiv1.PeerResponse {
+	peerInfos := deps.Manager.PeerInfoSnapshots()
+	results := make([]*restapiv1.PeerResponse, len(peerInfos))
+	for i, info := range peerInfos {
+		results[i] = restapiv1.WrapInfoSnapshot(info)
 	}
-	return stats
+	return results
 }
 
 func currentSyncStatus() *SyncStatus {
-	return &SyncStatus{LSMI: tangle.GetSolidMilestoneIndex(), LMI: tangle.GetLatestMilestoneIndex()}
+	return &SyncStatus{CMI: deps.Storage.GetConfirmedMilestoneIndex(), LMI: deps.Storage.GetLatestMilestoneIndex()}
+}
+
+func currentPublicNodeStatus() *PublicNodeStatus {
+	status := &PublicNodeStatus{}
+
+	status.IsHealthy = deps.Tangle.IsNodeHealthy()
+	status.IsSynced = deps.Storage.IsNodeAlmostSynced()
+
+	snapshotInfo := deps.Storage.GetSnapshotInfo()
+	if snapshotInfo != nil {
+		status.SnapshotIndex = snapshotInfo.SnapshotIndex
+		status.PruningIndex = snapshotInfo.PruningIndex
+	}
+
+	return status
 }
 
 func currentNodeStatus() *NodeStatus {
@@ -343,74 +340,61 @@ func currentNodeStatus() *NodeStatus {
 
 	// node status
 	var requestedMilestone milestone.Index
-	peekedRequest := gossip.RequestQueue().Peek()
-	queued, pending, processing := gossip.RequestQueue().Size()
+	peekedRequest := deps.RequestQueue.Peek()
+	queued, pending, processing := deps.RequestQueue.Size()
 	if peekedRequest != nil {
 		requestedMilestone = peekedRequest.MilestoneIndex
 	}
-	status.Version = cli.AppVersion
-	status.LatestVersion = cli.LatestGithubVersion
+
+	status.Version = deps.AppInfo.Version
+	status.LatestVersion = deps.AppInfo.LatestGitHubVersion
 	status.Uptime = time.Since(nodeStartAt).Milliseconds()
-	if !node.IsSkipped(autopeering.PLUGIN) {
-		status.AutopeeringID = autopeering.ID
-	}
-	status.IsHealthy = tangleplugin.IsNodeHealthy()
-	status.NodeAlias = config.NodeConfig.GetString(config.CfgNodeAlias)
+	status.NodeAlias = deps.NodeConfig.String(CfgNodeAlias)
+	status.NodeID = deps.Host.ID().String()
 
-	status.ConnectedPeersCount = peering.Manager().ConnectedPeerCount()
-
-	snapshotInfo := tangle.GetSnapshotInfo()
-	if snapshotInfo != nil {
-		status.SnapshotIndex = snapshotInfo.SnapshotIndex
-		status.PruningIndex = snapshotInfo.PruningIndex
-	}
+	status.ConnectedPeersCount = deps.Manager.ConnectedCount()
 	status.CurrentRequestedMs = requestedMilestone
 	status.RequestQueueQueued = queued
 	status.RequestQueuePending = pending
 	status.RequestQueueProcessing = processing
-	status.RequestQueueAvgLatency = gossip.RequestQueue().AvgLatency()
+	status.RequestQueueAvgLatency = deps.RequestQueue.AvgLatency()
 
 	// cache metrics
 	status.Caches = &CachesMetric{
-		Approvers: Cache{
-			Size: tangle.GetApproversStorageSize(),
+		Children: Cache{
+			Size: deps.Storage.GetChildrenStorageSize(),
 		},
 		RequestQueue: Cache{
 			Size: queued + pending,
 		},
-		Bundles: Cache{
-			Size: tangle.GetBundleStorageSize(),
-		},
 		Milestones: Cache{
-			Size: tangle.GetMilestoneStorageSize(),
+			Size: deps.Storage.GetMilestoneStorageSize(),
 		},
-		Transactions: Cache{
-			Size: tangle.GetTransactionStorageSize(),
+		Messages: Cache{
+			Size: deps.Storage.GetMessageStorageSize(),
 		},
-		IncomingTransactionWorkUnits: Cache{
-			Size: gossip.Processor().WorkUnitsSize(),
+		IncomingMessageWorkUnits: Cache{
+			Size: deps.MessageProcessor.WorkUnitsSize(),
 		},
 	}
 
 	// server metrics
 	status.ServerMetrics = &ServerMetrics{
-		NumberOfAllTransactions:        metrics.SharedServerMetrics.Transactions.Load(),
-		NumberOfNewTransactions:        metrics.SharedServerMetrics.NewTransactions.Load(),
-		NumberOfKnownTransactions:      metrics.SharedServerMetrics.KnownTransactions.Load(),
-		NumberOfInvalidTransactions:    metrics.SharedServerMetrics.InvalidTransactions.Load(),
-		NumberOfInvalidRequests:        metrics.SharedServerMetrics.InvalidRequests.Load(),
-		NumberOfStaleTransactions:      metrics.SharedServerMetrics.StaleTransactions.Load(),
-		NumberOfReceivedTransactionReq: metrics.SharedServerMetrics.ReceivedTransactionRequests.Load(),
-		NumberOfReceivedMilestoneReq:   metrics.SharedServerMetrics.ReceivedMilestoneRequests.Load(),
-		NumberOfReceivedHeartbeats:     metrics.SharedServerMetrics.ReceivedHeartbeats.Load(),
-		NumberOfSentTransactions:       metrics.SharedServerMetrics.SentTransactions.Load(),
-		NumberOfSentTransactionsReq:    metrics.SharedServerMetrics.SentTransactionRequests.Load(),
-		NumberOfSentMilestoneReq:       metrics.SharedServerMetrics.SentMilestoneRequests.Load(),
-		NumberOfSentHeartbeats:         metrics.SharedServerMetrics.SentHeartbeats.Load(),
-		NumberOfDroppedSentPackets:     metrics.SharedServerMetrics.DroppedMessages.Load(),
-		NumberOfSentSpamTxsCount:       metrics.SharedServerMetrics.SentSpamTransactions.Load(),
-		NumberOfValidatedBundles:       metrics.SharedServerMetrics.ValidatedBundles.Load(),
-		NumberOfSeenSpentAddr:          metrics.SharedServerMetrics.SeenSpentAddresses.Load(),
+		AllMessages:          deps.ServerMetrics.Messages.Load(),
+		NewMessages:          deps.ServerMetrics.NewMessages.Load(),
+		KnownMessages:        deps.ServerMetrics.KnownMessages.Load(),
+		InvalidMessages:      deps.ServerMetrics.InvalidMessages.Load(),
+		InvalidRequests:      deps.ServerMetrics.InvalidRequests.Load(),
+		ReceivedMessageReq:   deps.ServerMetrics.ReceivedMessageRequests.Load(),
+		ReceivedMilestoneReq: deps.ServerMetrics.ReceivedMilestoneRequests.Load(),
+		ReceivedHeartbeats:   deps.ServerMetrics.ReceivedHeartbeats.Load(),
+		SentMessages:         deps.ServerMetrics.SentMessages.Load(),
+		SentMessageReq:       deps.ServerMetrics.SentMessageRequests.Load(),
+		SentMilestoneReq:     deps.ServerMetrics.SentMilestoneRequests.Load(),
+		SentHeartbeats:       deps.ServerMetrics.SentHeartbeats.Load(),
+		DroppedSentPackets:   deps.ServerMetrics.DroppedMessages.Load(),
+		SentSpamMsgsCount:    deps.ServerMetrics.SentSpamMessages.Load(),
+		ValidatedMessages:    deps.ServerMetrics.ValidatedMessages.Load(),
 	}
 
 	// memory metrics

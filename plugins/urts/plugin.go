@@ -3,68 +3,104 @@ package urts
 import (
 	"time"
 
-	"github.com/iotaledger/hive.go/daemon"
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/logger"
-	"github.com/iotaledger/hive.go/node"
+	"go.uber.org/dig"
 
-	"github.com/gohornet/hornet/pkg/config"
-	"github.com/gohornet/hornet/pkg/dag"
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/metrics"
+	"github.com/gohornet/hornet/pkg/model/storage"
+	"github.com/gohornet/hornet/pkg/node"
 	"github.com/gohornet/hornet/pkg/shutdown"
+	"github.com/gohornet/hornet/pkg/tangle"
 	"github.com/gohornet/hornet/pkg/tipselect"
 	"github.com/gohornet/hornet/pkg/whiteflag"
-	tangleplugin "github.com/gohornet/hornet/plugins/tangle"
+	"github.com/iotaledger/hive.go/configuration"
+	"github.com/iotaledger/hive.go/events"
+	"github.com/iotaledger/hive.go/logger"
 )
 
-var (
-	PLUGIN = node.NewPlugin("URTS", node.Enabled, configure, run)
-	log    *logger.Logger
+func init() {
+	Plugin = &node.Plugin{
+		Status: node.Enabled,
+		Pluggable: node.Pluggable{
+			Name:      "URTS",
+			DepsFunc:  func(cDeps dependencies) { deps = cDeps },
+			Params:    params,
+			Provide:   provide,
+			Configure: configure,
+			Run:       run,
+		},
+	}
+}
 
-	TipSelector *tipselect.TipSelector
+var (
+	Plugin *node.Plugin
+	log    *logger.Logger
+	deps   dependencies
 
 	// Closures
-	onBundleSolid        *events.Closure
+	onMessageSolid       *events.Closure
 	onMilestoneConfirmed *events.Closure
 )
 
-func configure(plugin *node.Plugin) {
-	log = logger.NewLogger(plugin.Name)
+type dependencies struct {
+	dig.In
+	TipSelector *tipselect.TipSelector
+	Storage     *storage.Storage
+	Tangle      *tangle.Tangle
+}
 
-	TipSelector = tipselect.New(
-		config.NodeConfig.GetInt(config.CfgTipSelMaxDeltaTxYoungestRootSnapshotIndexToLSMI),
-		config.NodeConfig.GetInt(config.CfgTipSelMaxDeltaTxOldestRootSnapshotIndexToLSMI),
-		config.NodeConfig.GetInt(config.CfgTipSelBelowMaxDepth),
+func provide(c *dig.Container) {
+	type tipseldeps struct {
+		dig.In
+		Storage       *storage.Storage
+		ServerMetrics *metrics.ServerMetrics
+		NodeConfig    *configuration.Configuration `name:"nodeConfig"`
+		BelowMaxDepth int                          `name:"belowMaxDepth"`
+	}
 
-		config.NodeConfig.GetInt(config.CfgTipSelNonLazy+config.CfgTipSelRetentionRulesTipsLimit),
-		time.Duration(time.Second*time.Duration(config.NodeConfig.GetInt(config.CfgTipSelNonLazy+config.CfgTipSelMaxReferencedTipAgeSeconds))),
-		config.NodeConfig.GetUint32(config.CfgTipSelNonLazy+config.CfgTipSelMaxApprovers),
-		config.NodeConfig.GetInt(config.CfgTipSelNonLazy+config.CfgTipSelSpammerTipsThreshold),
+	if err := c.Provide(func(deps tipseldeps) *tipselect.TipSelector {
+		return tipselect.New(
+			deps.Storage,
+			deps.ServerMetrics,
 
-		config.NodeConfig.GetInt(config.CfgTipSelSemiLazy+config.CfgTipSelRetentionRulesTipsLimit),
-		time.Duration(time.Second*time.Duration(config.NodeConfig.GetInt(config.CfgTipSelSemiLazy+config.CfgTipSelMaxReferencedTipAgeSeconds))),
-		config.NodeConfig.GetUint32(config.CfgTipSelSemiLazy+config.CfgTipSelMaxApprovers),
-		config.NodeConfig.GetInt(config.CfgTipSelSemiLazy+config.CfgTipSelSpammerTipsThreshold),
-	)
+			deps.NodeConfig.Int(CfgTipSelMaxDeltaMsgYoungestConeRootIndexToCMI),
+			deps.NodeConfig.Int(CfgTipSelMaxDeltaMsgOldestConeRootIndexToCMI),
+			deps.BelowMaxDepth,
 
+			deps.NodeConfig.Int(CfgTipSelNonLazy+CfgTipSelRetentionRulesTipsLimit),
+			deps.NodeConfig.Duration(CfgTipSelNonLazy+CfgTipSelMaxReferencedTipAge),
+			uint32(deps.NodeConfig.Int64(CfgTipSelNonLazy+CfgTipSelMaxChildren)),
+			deps.NodeConfig.Int(CfgTipSelNonLazy+CfgTipSelSpammerTipsThreshold),
+
+			deps.NodeConfig.Int(CfgTipSelSemiLazy+CfgTipSelRetentionRulesTipsLimit),
+			deps.NodeConfig.Duration(CfgTipSelSemiLazy+CfgTipSelMaxReferencedTipAge),
+			uint32(deps.NodeConfig.Int64(CfgTipSelSemiLazy+CfgTipSelMaxChildren)),
+			deps.NodeConfig.Int(CfgTipSelSemiLazy+CfgTipSelSpammerTipsThreshold),
+		)
+	}); err != nil {
+		panic(err)
+	}
+}
+
+func configure() {
+	log = logger.NewLogger(Plugin.Name)
 	configureEvents()
 }
 
-func run(_ *node.Plugin) {
-	daemon.BackgroundWorker("Tipselection[Events]", func(shutdownSignal <-chan struct{}) {
+func run() {
+	Plugin.Daemon().BackgroundWorker("Tipselection[Events]", func(shutdownSignal <-chan struct{}) {
 		attachEvents()
 		<-shutdownSignal
 		detachEvents()
 	}, shutdown.PriorityTipselection)
 
-	daemon.BackgroundWorker("Tipselection[Cleanup]", func(shutdownSignal <-chan struct{}) {
+	Plugin.Daemon().BackgroundWorker("Tipselection[Cleanup]", func(shutdownSignal <-chan struct{}) {
 		for {
 			select {
 			case <-shutdownSignal:
 				return
 			case <-time.After(time.Second):
 				ts := time.Now()
-				removedTipCount := TipSelector.CleanUpReferencedTips()
+				removedTipCount := deps.TipSelector.CleanUpReferencedTips()
 				log.Debugf("CleanUpReferencedTips finished, removed: %d, took: %v", removedTipCount, time.Since(ts).Truncate(time.Millisecond))
 			}
 		}
@@ -72,45 +108,35 @@ func run(_ *node.Plugin) {
 }
 
 func configureEvents() {
-	onBundleSolid = events.NewClosure(func(cachedBndl *tangle.CachedBundle) {
-		cachedBndl.ConsumeBundle(func(bndl *tangle.Bundle) { // bundle -1
+	onMessageSolid = events.NewClosure(func(cachedMsgMeta *storage.CachedMetadata) {
+		cachedMsgMeta.ConsumeMetadata(func(metadata *storage.MessageMetadata) { // metadata -1
 			// do not add tips during syncing, because it is not needed at all
-			if !tangle.IsNodeSyncedWithThreshold() {
+			if !deps.Storage.IsNodeAlmostSynced() {
 				return
 			}
 
-			if bndl.IsInvalidPastCone() || !bndl.IsValid() || !bndl.ValidStrictSemantics() {
-				// ignore invalid bundles or semantically invalid bundles or bundles with invalid past cone
-				return
-			}
-
-			TipSelector.AddTip(bndl)
+			deps.TipSelector.AddTip(metadata)
 		})
 	})
 
 	onMilestoneConfirmed = events.NewClosure(func(confirmation *whiteflag.Confirmation) {
-		// do not propagate during syncing, because it is not needed at all
-		if !tangle.IsNodeSyncedWithThreshold() {
+		// do not update tip scores during syncing, because it is not needed at all
+		if !deps.Storage.IsNodeAlmostSynced() {
 			return
 		}
 
-		// propagate new transaction root snapshot indexes to the future cone for URTS
 		ts := time.Now()
-		dag.UpdateTransactionRootSnapshotIndexes(confirmation.Mutations.TailsReferenced, confirmation.MilestoneIndex)
-		log.Debugf("UpdateTransactionRootSnapshotIndexes finished, took: %v", time.Since(ts).Truncate(time.Millisecond))
-
-		ts = time.Now()
-		removedTipCount := TipSelector.UpdateScores()
+		removedTipCount := deps.TipSelector.UpdateScores()
 		log.Debugf("UpdateScores finished, removed: %d, took: %v", removedTipCount, time.Since(ts).Truncate(time.Millisecond))
 	})
 }
 
 func attachEvents() {
-	tangleplugin.Events.BundleSolid.Attach(onBundleSolid)
-	tangleplugin.Events.MilestoneConfirmed.Attach(onMilestoneConfirmed)
+	deps.Tangle.Events.MessageSolid.Attach(onMessageSolid)
+	deps.Tangle.Events.MilestoneConfirmed.Attach(onMilestoneConfirmed)
 }
 
 func detachEvents() {
-	tangleplugin.Events.BundleSolid.Detach(onBundleSolid)
-	tangleplugin.Events.MilestoneConfirmed.Detach(onMilestoneConfirmed)
+	deps.Tangle.Events.MessageSolid.Detach(onMessageSolid)
+	deps.Tangle.Events.MilestoneConfirmed.Detach(onMilestoneConfirmed)
 }

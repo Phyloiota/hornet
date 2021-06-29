@@ -9,23 +9,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iotaledger/iota.go/consts"
-	"github.com/iotaledger/iota.go/trinary"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/gohornet/hornet/pkg/model/hornet"
+	iotago "github.com/iotaledger/iota.go/v2"
 )
 
 type Vertex struct {
-	ID      string `json:"id"`
-	Parent1 string `json:"parent1"`
-	Parent2 string `json:"parent2"`
+	MessageID string   `json:"id"`
+	Parents   []string `json:"parents"`
 }
 
-func randHash() trinary.Trytes {
-	var h string
-	for i := 0; i < consts.HashTrytesSize; i++ {
-		h += string(consts.TryteAlphabet[rand.Intn(len(consts.TryteAlphabet))])
+// returns length amount random bytes
+func randBytes(length int) []byte {
+	var b []byte
+	for i := 0; i < length; i++ {
+		b = append(b, byte(rand.Intn(256)))
 	}
-	return h
+	return b
+}
+
+func randMessageID() hornet.MessageID {
+	return hornet.MessageID(randBytes(iotago.MessageIDLength))
 }
 
 func TestVisualizer(t *testing.T) {
@@ -38,17 +43,24 @@ func TestVisualizer(t *testing.T) {
 
 	var vertices []Vertex
 	const getFromLast = 30
-	for i := 0; i < 10000; i++ {
-		v := Vertex{ID: randHash()}
+	for i := 0; i < 1000; i++ {
+		v := Vertex{MessageID: randMessageID().ToHex()}
 		if i <= getFromLast {
-			v.Parent1 = consts.NullHashTrytes
-			v.Parent2 = consts.NullHashTrytes
+			// only one parent at the beginning
+			v.Parents = hornet.MessageIDs{hornet.GetNullMessageID()}.ToHex()
 			vertices = append(vertices, v)
 			continue
 		}
+
 		l := len(vertices)
-		v.Parent1 = vertices[l-1-rand.Intn(getFromLast)].ID
-		v.Parent2 = vertices[l-1-rand.Intn(getFromLast)].ID
+		parents := hornet.MessageIDs{}
+		for j := 2; j <= 2+rand.Intn(7); j++ {
+			msgID, err := hornet.MessageIDFromHex(vertices[l-1-rand.Intn(getFromLast)].MessageID)
+			assert.NoError(t, err)
+			parents = append(parents, msgID)
+		}
+		parents = parents.RemoveDupsAndSortByLexicalOrder()
+		v.Parents = parents.ToHex()
 		vertices = append(vertices, v)
 	}
 

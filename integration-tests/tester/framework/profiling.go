@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/go-echarts/go-echarts/charts"
+	"github.com/gorilla/websocket"
+
+	"github.com/gohornet/hornet/pkg/tangle"
 	"github.com/gohornet/hornet/pkg/tipselect"
 	"github.com/gohornet/hornet/plugins/dashboard"
-	"github.com/gohornet/hornet/plugins/metrics"
-	tangleplugin "github.com/gohornet/hornet/plugins/tangle"
-	"github.com/gorilla/websocket"
 	"github.com/iotaledger/hive.go/websockethub"
 )
 
@@ -66,23 +66,23 @@ func (n *Profiler) TakeHeapSnapshot() error {
 	return n.writeProfile(fileName, profileBytes)
 }
 
-// GraphMetrics graphs metrics about TPS, memory consumption, confirmation rate of the node and saves it into the log dir.
+// GraphMetrics graphs metrics about MPS, memory consumption, confirmation rate of the node and saves it into the log dir.
 func (n *Profiler) GraphMetrics(dur time.Duration) error {
 	var err error
 
-	// TPS
-	var tpsChartXAxis []string
-	var newTPS, incomingTPS, outgoingTPS []int32
-	tpsChart := charts.NewLine()
-	tpsChart.SetGlobalOptions(
-		charts.TitleOpts{Title: "Transactions Per Second"},
+	// MPS
+	var mpsChartXAxis []string
+	var newMPS, incomingMPS, outgoingMPS []int32
+	mpsChart := charts.NewLine()
+	mpsChart.SetGlobalOptions(
+		charts.TitleOpts{Title: "Messages Per Second"},
 		charts.DataZoomOpts{XAxisIndex: []int{0}, Start: 0, End: 100},
 	)
 
 	// conf. and issuance rate
-	confRateChart := charts.NewLine()
-	confRateChart.SetGlobalOptions(
-		charts.TitleOpts{Title: "Confirmation Rate"},
+	referencedRateChart := charts.NewLine()
+	referencedRateChart.SetGlobalOptions(
+		charts.TitleOpts{Title: "Referenced Rate"},
 		charts.DataZoomOpts{XAxisIndex: []int{0}, Start: 0, End: 100},
 	)
 	issuanceRateChart := charts.NewBar()
@@ -91,7 +91,7 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 		charts.DataZoomOpts{XAxisIndex: []int{0}, Start: 0, End: 100},
 	)
 	var confIssXAxis []string
-	var confRate []float64
+	var referencedRate []float64
 	var issuanceInterval []float64
 
 	// memory
@@ -115,7 +115,7 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 		charts.DataZoomOpts{XAxisIndex: []int{0}, Start: 0, End: 100},
 	)
 	var dbSizeXAxis []string
-	var dbSizeTangle, dbSizeSnapshot, dbSizeSpent []int64
+	var dbSizeTotal []int64
 
 	// tip selection
 	tipSelChart := charts.NewLine()
@@ -131,7 +131,7 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 		return err
 	}
 
-	if err := registerWSTopics(conn, dashboard.MsgTypeTPSMetric, dashboard.MsgTypeTipSelMetric, dashboard.MsgTypeConfirmedMsMetrics,
+	if err := registerWSTopics(conn, dashboard.MsgTypeMPSMetric, dashboard.MsgTypeTipSelMetric, dashboard.MsgTypeConfirmedMsMetrics,
 		dashboard.MsgTypeDatabaseSizeMetric, dashboard.MsgTypeNodeStatus); err != nil {
 		return err
 	}
@@ -155,15 +155,15 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 		}
 		switch m.Type {
 
-		case dashboard.MsgTypeTPSMetric:
-			tpsMetric := &metrics.TPSMetrics{}
-			if err := json.Unmarshal(msgRaw, &dashboard.Msg{Data: tpsMetric}); err != nil {
+		case dashboard.MsgTypeMPSMetric:
+			mpsMetric := &tangle.MPSMetrics{}
+			if err := json.Unmarshal(msgRaw, &dashboard.Msg{Data: mpsMetric}); err != nil {
 				return err
 			}
-			tpsChartXAxis = append(tpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
-			incomingTPS = append(incomingTPS, int32(tpsMetric.Incoming))
-			outgoingTPS = append(outgoingTPS, -int32(tpsMetric.Outgoing))
-			newTPS = append(newTPS, int32(tpsMetric.New))
+			mpsChartXAxis = append(mpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
+			incomingMPS = append(incomingMPS, int32(mpsMetric.Incoming))
+			outgoingMPS = append(outgoingMPS, -int32(mpsMetric.Outgoing))
+			newMPS = append(newMPS, int32(mpsMetric.New))
 
 		case dashboard.MsgTypeTipSelMetric:
 			tipSelMetric := &tipselect.TipSelStats{}
@@ -171,11 +171,11 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 				return err
 			}
 
-			tipSelXAxis = append(tpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
+			tipSelXAxis = append(mpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
 			tipSelDur = append(tipSelDur, int64(tipSelMetric.Duration)/int64(time.Millisecond))
 
 		case dashboard.MsgTypeConfirmedMsMetrics:
-			confMetrics := []*tangleplugin.ConfirmedMilestoneMetric{}
+			confMetrics := []*tangle.ConfirmedMilestoneMetric{}
 			if err := json.Unmarshal(msgRaw, &dashboard.Msg{Data: &confMetrics}); err != nil {
 				return err
 			}
@@ -184,7 +184,7 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 			}
 			confMetric := confMetrics[len(confMetrics)-1]
 			confIssXAxis = append(confIssXAxis, fmt.Sprintf("Ms %s", strconv.Itoa(int(confMetric.MilestoneIndex))))
-			confRate = append(confRate, confMetric.ConfirmationRate)
+			referencedRate = append(referencedRate, confMetric.ReferencedRate)
 			issuanceInterval = append(issuanceInterval, confMetric.TimeSinceLastMilestone)
 
 		case dashboard.MsgTypeDatabaseSizeMetric:
@@ -196,10 +196,8 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 				continue
 			}
 			dbSizeMetric := dbSizeMetrics[len(dbSizeMetrics)-1]
-			dbSizeXAxis = append(tpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
-			dbSizeTangle = append(dbSizeTangle, dbSizeMetric.Tangle/byteMBDivider)
-			dbSizeSnapshot = append(dbSizeTangle, dbSizeMetric.Snapshot/byteMBDivider)
-			dbSizeSpent = append(dbSizeTangle, dbSizeMetric.Spent/byteMBDivider)
+			dbSizeXAxis = append(mpsChartXAxis, fmt.Sprintf("%s sec", strconv.Itoa(int(time.Since(s).Seconds()))))
+			dbSizeTotal = append(dbSizeTotal, dbSizeMetric.Total/byteMBDivider)
 
 		case dashboard.MsgTypeNodeStatus:
 			nodeStatus := &dashboard.NodeStatus{
@@ -223,19 +221,17 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 		}
 	}
 
-	tpsChart.AddXAxis(tpsChartXAxis).
-		AddYAxis("New", newTPS).
-		AddYAxis("Incoming", incomingTPS).
-		AddYAxis("Outgoing", outgoingTPS)
+	mpsChart.AddXAxis(mpsChartXAxis).
+		AddYAxis("New", newMPS).
+		AddYAxis("Incoming", incomingMPS).
+		AddYAxis("Outgoing", outgoingMPS)
 
-	confRateChart.AddXAxis(confIssXAxis).
-		AddYAxis("Conf. Rate %", confRate)
+	referencedRateChart.AddXAxis(confIssXAxis).
+		AddYAxis("Ref. Rate %", referencedRate)
 	issuanceRateChart.AddXAxis(confIssXAxis).
 		AddYAxis("Issuance Delta", issuanceInterval)
 
-	dbSizeChart.AddXAxis(dbSizeXAxis).AddYAxis("Tangle", dbSizeTangle).
-		AddYAxis("Snapshot", dbSizeSnapshot).
-		AddYAxis("Spent", dbSizeSpent)
+	dbSizeChart.AddXAxis(dbSizeXAxis).AddYAxis("Total", dbSizeTotal)
 
 	memChart.AddXAxis(memChartXAxis).
 		AddYAxis("Sys", memSys).
@@ -253,7 +249,7 @@ func (n *Profiler) GraphMetrics(dur time.Duration) error {
 
 	chartPage := charts.NewPage()
 	chartPage.PageTitle = n.targetName
-	chartPage.Add(tpsChart, memChart, dbSizeChart, memObjsChart, tipSelChart, confRateChart, issuanceRateChart)
+	chartPage.Add(mpsChart, memChart, dbSizeChart, memObjsChart, tipSelChart, referencedRateChart, issuanceRateChart)
 
 	var buf bytes.Buffer
 	if err := chartPage.Render(&buf); err != nil {

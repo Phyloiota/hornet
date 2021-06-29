@@ -4,77 +4,47 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/iotaledger/iota.go/bundle"
-	"github.com/iotaledger/iota.go/consts"
-	"github.com/iotaledger/iota.go/transaction"
-	"github.com/iotaledger/iota.go/trinary"
-
 	"github.com/gohornet/hornet/pkg/metrics"
 	"github.com/gohornet/hornet/pkg/model/hornet"
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/storage"
 	"github.com/gohornet/hornet/pkg/pow"
-	"github.com/gohornet/hornet/pkg/utils"
-	"github.com/gohornet/hornet/plugins/curl"
-
-	"go.uber.org/atomic"
+	iotago "github.com/iotaledger/iota.go/v2"
 )
 
-// SendBundleFunc is a function which sends a bundle to the network.
-type SendBundleFunc = func(b bundle.Bundle) error
+// SendMessageFunc is a function which sends a message to the network.
+type SendMessageFunc = func(msg *storage.Message) error
 
 // SpammerTipselFunc selects tips for the spammer.
-type SpammerTipselFunc = func() (isSemiLazy bool, tips hornet.Hashes, err error)
+type SpammerTipselFunc = func() (isSemiLazy bool, tips hornet.MessageIDs, err error)
 
-// Spammer is used to issue transactions to the IOTA network to create load on the tangle.
+// Spammer is used to issue messages to the IOTA network to create load on the tangle.
 type Spammer struct {
-
-	// config options
-	txAddress            string
-	message              string
-	tagSubstring         string
-	tagSemiLazySubstring string
-	tipselFunc           SpammerTipselFunc
-	mwm                  int
-	powHandler           *pow.Handler
-	sendBundleFunc       SendBundleFunc
-
-	seed      trinary.Trytes
-	addrIndex *atomic.Uint64
+	networkID       uint64
+	message         string
+	index           string
+	indexSemiLazy   string
+	tipselFunc      SpammerTipselFunc
+	powHandler      *pow.Handler
+	sendMessageFunc SendMessageFunc
+	serverMetrics   *metrics.ServerMetrics
 }
 
 // New creates a new spammer instance.
-func New(txAddress string, message string, tag string, tagSemiLazy string, tipselFunc SpammerTipselFunc, mwm int, powHandler *pow.Handler, sendBundleFunc SendBundleFunc) *Spammer {
-
-	tagSubstring := trinary.MustPad(tag, consts.TagTrinarySize/3)[:consts.TagTrinarySize/3]
-	tagSemiLazySubstring := tagSubstring
-	if tagSemiLazy != "" {
-		tagSemiLazySubstring = trinary.MustPad(tagSemiLazy, consts.TagTrinarySize/3)[:consts.TagTrinarySize/3]
-	}
-
-	if len(tagSubstring) > 20 {
-		tagSubstring = string([]rune(tagSubstring)[:20])
-	}
-	if len(tagSemiLazySubstring) > 20 {
-		tagSemiLazySubstring = string([]rune(tagSemiLazySubstring)[:20])
-	}
+func New(networkID uint64, message string, index string, indexSemiLazy string, tipselFunc SpammerTipselFunc, powHandler *pow.Handler, sendMessageFunc SendMessageFunc, serverMetrics *metrics.ServerMetrics) *Spammer {
 
 	return &Spammer{
-		txAddress:            trinary.MustPad(txAddress, consts.AddressTrinarySize/3)[:consts.AddressTrinarySize/3],
-		message:              message,
-		tagSubstring:         tagSubstring,
-		tagSemiLazySubstring: tagSemiLazySubstring,
-		tipselFunc:           tipselFunc,
-		mwm:                  mwm,
-		powHandler:           powHandler,
-		sendBundleFunc:       sendBundleFunc,
-		seed:                 utils.RandomTrytesInsecure(81),
-		addrIndex:            atomic.NewUint64(0),
+		networkID:       networkID,
+		message:         message,
+		index:           index,
+		indexSemiLazy:   indexSemiLazy,
+		tipselFunc:      tipselFunc,
+		powHandler:      powHandler,
+		sendMessageFunc: sendMessageFunc,
+		serverMetrics:   serverMetrics,
 	}
 }
 
-func (s *Spammer) DoSpam(bundleSize int, valueSpam bool, shutdownSignal <-chan struct{}) (time.Duration, time.Duration, error) {
-
-	tag := s.tagSubstring
+func (s *Spammer) DoSpam(shutdownSignal <-chan struct{}) (time.Duration, time.Duration, error) {
 
 	timeStart := time.Now()
 	isSemiLazy, tips, err := s.tipselFunc()
@@ -83,94 +53,48 @@ func (s *Spammer) DoSpam(bundleSize int, valueSpam bool, shutdownSignal <-chan s
 	}
 	durationGTTA := time.Since(timeStart)
 
+	indexation := s.index
 	if isSemiLazy {
-		tag = s.tagSemiLazySubstring
+		indexation = s.indexSemiLazy
 	}
 
-	infoMsg := fmt.Sprintf("gTTA took %v", durationGTTA.Truncate(time.Millisecond))
-
-	var seedIndex uint64
-	if valueSpam {
-		seedIndex = s.addrIndex.Inc()
+	index := []byte(indexation)
+	if len(index) > storage.IndexationIndexLength {
+		index = index[:storage.IndexationIndexLength]
 	}
 
-	txCountValue := int(metrics.SharedServerMetrics.SentSpamTransactions.Load()) + bundleSize
-	b, err := createBundle(s.seed, seedIndex, s.txAddress, s.message, tag, bundleSize, valueSpam, txCountValue, infoMsg)
-	if err != nil {
-		return time.Duration(0), time.Duration(0), err
+	txCount := int(s.serverMetrics.SentSpamMessages.Load()) + 1
+
+	now := time.Now()
+	messageString := s.message
+	messageString += fmt.Sprintf("\nCount: %06d", txCount)
+	messageString += fmt.Sprintf("\nTimestamp: %s", now.Format(time.RFC3339))
+	messageString += fmt.Sprintf("\nTipselection: %v", durationGTTA.Truncate(time.Microsecond))
+
+	iotaMsg := &iotago.Message{
+		NetworkID: s.networkID,
+		Parents:   tips.ToSliceOfArrays(),
+		Payload:   &iotago.Indexation{Index: index, Data: []byte(messageString)},
 	}
 
 	timeStart = time.Now()
-	err = s.doPow(b, tips[0].Trytes(), tips[1].Trytes(), s.mwm, shutdownSignal)
-	if err != nil {
+	if err := s.powHandler.DoPoW(iotaMsg, shutdownSignal, 1, func() (tips hornet.MessageIDs, err error) {
+		// refresh tips of the spammer if PoW takes longer than a configured duration.
+		_, refreshedTips, err := s.tipselFunc()
+		return refreshedTips, err
+	}); err != nil {
 		return time.Duration(0), time.Duration(0), err
 	}
 	durationPOW := time.Since(timeStart)
 
-	if err := s.sendBundleFunc(b); err != nil {
+	msg, err := storage.NewMessage(iotaMsg, iotago.DeSeriModePerformValidation)
+	if err != nil {
+		return time.Duration(0), time.Duration(0), err
+	}
+
+	if err := s.sendMessageFunc(msg); err != nil {
 		return time.Duration(0), time.Duration(0), err
 	}
 
 	return durationGTTA, durationPOW, nil
-}
-
-func (s *Spammer) doPow(b bundle.Bundle, trunk trinary.Hash, branch trinary.Hash, mwm int, shutdownSignal <-chan struct{}) error {
-	var prev trinary.Hash
-
-	for i := len(b) - 1; i >= 0; i-- {
-		switch {
-		case i == len(b)-1:
-			// Last tx in the bundle
-			b[i].TrunkTransaction = trunk
-			b[i].BranchTransaction = branch
-		default:
-			b[i].TrunkTransaction = prev
-			b[i].BranchTransaction = trunk
-		}
-
-		b[i].AttachmentTimestamp = time.Now().UnixNano() / int64(time.Millisecond)
-		b[i].AttachmentTimestampLowerBound = consts.LowerBoundAttachmentTimestamp
-		b[i].AttachmentTimestampUpperBound = consts.UpperBoundAttachmentTimestamp
-
-		trytes, err := transaction.TransactionToTrytes(&b[i])
-		if err != nil {
-			return err
-		}
-
-		select {
-		case <-shutdownSignal:
-			return tangle.ErrOperationAborted
-		default:
-		}
-
-		nonce, err := s.powHandler.DoPoW(trytes, mwm, 1)
-		if err != nil {
-			return err
-		}
-
-		b[i].Nonce = nonce
-
-		// set new transaction hash
-		hash, err := transactionHash(&b[i])
-		if err != nil {
-			return err
-		}
-
-		b[i].Hash = hash
-		prev = hash
-	}
-	return nil
-}
-
-// transactionHash makes a transaction hash from the given transaction.
-func transactionHash(t *transaction.Transaction) (trinary.Hash, error) {
-	trits, err := transaction.TransactionToTrits(t)
-	if err != nil {
-		return "", err
-	}
-	hashTrits, err := curl.Hasher().Hash(trits)
-	if err != nil {
-		return "", err
-	}
-	return trinary.MustTritsToTrytes(hashTrits), nil
 }

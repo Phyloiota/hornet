@@ -1,19 +1,16 @@
 package dashboard
 
 import (
-	"github.com/iotaledger/hive.go/daemon"
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/node"
-
 	"github.com/gohornet/hornet/pkg/shutdown"
 	"github.com/gohornet/hornet/pkg/tipselect"
 	"github.com/gohornet/hornet/plugins/urts"
+	"github.com/iotaledger/hive.go/events"
 )
 
 func runTipSelMetricWorker() {
 
 	// check if URTS plugin is enabled
-	if node.IsSkipped(urts.PLUGIN) {
+	if Plugin.Node.IsSkipped(urts.Plugin) {
 		return
 	}
 
@@ -21,11 +18,11 @@ func runTipSelMetricWorker() {
 		hub.BroadcastMsg(&Msg{Type: MsgTypeTipSelMetric, Data: metrics})
 	})
 
-	daemon.BackgroundWorker("Dashboard[TipSelMetricUpdater]", func(shutdownSignal <-chan struct{}) {
-		urts.TipSelector.Events.TipSelPerformed.Attach(onTipSelPerformed)
+	Plugin.Daemon().BackgroundWorker("Dashboard[TipSelMetricUpdater]", func(shutdownSignal <-chan struct{}) {
+		deps.TipSelector.Events.TipSelPerformed.Attach(onTipSelPerformed)
 		<-shutdownSignal
 		log.Info("Stopping Dashboard[TipSelMetricUpdater] ...")
-		urts.TipSelector.Events.TipSelPerformed.Detach(onTipSelPerformed)
+		deps.TipSelector.Events.TipSelPerformed.Detach(onTipSelPerformed)
 		log.Info("Stopping Dashboard[TipSelMetricUpdater] ... done")
 	}, shutdown.PriorityDashboard)
 }
