@@ -4,8 +4,7 @@ on:
     paths-ignore:
       - 'docs/**'
     branches:
-      - main
-      - develop
+      - if-deployment
   pull_request:
     paths-ignore:
       - 'docs/**'

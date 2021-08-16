@@ -4,10 +4,14 @@ on:
     paths:
       - "docker/Dockerfile"
       - "docker-compose.yml"
+    branches:
+      - if-deployment
   pull_request:
     paths:
       - "docker/Dockerfile"
       - "docker-compose.yml"
+    branches:
+      - if-deployment
 
 jobs:
   build:

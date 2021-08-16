@@ -4,7 +4,7 @@ on:
     paths-ignore:
       - 'docs/**'
     branches:
-      - develop
+      - if-deployment
 
 jobs:
   security:
@@ -17,5 +17,5 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          args: --org=gohornet
+          args: --org=iotaledger
           command: monitor

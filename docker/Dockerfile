@@ -5,10 +5,10 @@ FROM golang@sha256:f7a5c5872d4bb68e152be72e4a4bf9a142a47ec2dcbb4074798d4feb6197a
 ARG BUILD_TAGS=builtin_static,rocksdb
 
 LABEL org.label-schema.description="HORNET - The IOTA community node"
-LABEL org.label-schema.name="gohornet/hornet"
+LABEL org.label-schema.name="iotaledger/hornet"
 LABEL org.label-schema.schema-version="1.0"
-LABEL org.label-schema.vcs-url="https://github.com/gohornet/hornet"
-LABEL org.label-schema.usage="https://github.com/gohornet/hornet/blob/master/DOCKER.md"
+LABEL org.label-schema.vcs-url="https://github.com/iotaledger/hornet"
+LABEL org.label-schema.usage="https://github.com/gohornet/hornet/blob/main/documentation/docs/getting_started/using_docker.md"
 
 # Ensure ca-certificates are up to date
 RUN update-ca-certificates
@@ -37,17 +37,22 @@ RUN GOOS=linux GOARCH=amd64 go build \
 ############################
 # Image
 ############################
-# https://github.com/GoogleContainerTools/distroless/tree/master/cc
-# using distroless cc image, which includes everything in the base image (glibc, libssl and openssl)
-FROM gcr.io/distroless/cc@sha256:4cad7484b00d98ecb300916b1ab71d6c71babd6860c6c5dd6313be41a8c55adb
+FROM alpine:latest
 
 EXPOSE 8081/tcp
 EXPOSE 14265/tcp
 EXPOSE 15600/tcp
 EXPOSE 1883/tcp
 
+# Create the group and user
+RUN addgroup --gid 39999 hornet \
+ && adduser -h /app -s /bin/sh -G hornet -u 39999 -D hornet
+
+# Install dependencies
+RUN apk add --no-cache gcompat libc6-compat libstdc++ libgcc openssl openssl-dev
+
 # Copy the binary into distroless image
-COPY --chown=nonroot:nonroot --from=build /go/bin/hornet /app/hornet
+COPY --chown=hornet:hornet --from=build /go/bin/hornet /app/hornet
 
 # Copy the assets
 COPY ./config.json /app/config.json
@@ -56,6 +61,6 @@ COPY ./peering.json /app/peering.json
 COPY ./profiles.json /app/profiles.json
 
 WORKDIR /app
-USER nonroot
+USER hornet
 
 ENTRYPOINT ["/app/hornet"]

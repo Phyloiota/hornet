@@ -83,8 +83,8 @@ nfpms:
     file_name_template: '{{ tolower .ProjectName }}_{{ replace .Version "v" "" }}_{{ .Arch }}'
     vendor: GoReleaser
     license: Apache 2.0
-    maintainer: GoHORNET
-    homepage: https://github.com/gohornet/hornet
+    maintainer: iotaledger
+    homepage: https://github.com/iotaledger/hornet
     description: HORNET is a powerful IOTA fullnode software.
     formats:
       - deb
@@ -151,5 +151,5 @@ release:
   prerelease: auto
   name_template: "{{.ProjectName}}-{{.Version}}"
   github:
-    owner: gohornet
+    owner: iotaledger
     name: hornet
